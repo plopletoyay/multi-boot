@@ -48,6 +48,7 @@ CYAN=$'\033[1;36m'
 RESET=$'\033[0m'
 APT_UPDATED=0
 INSTALLED_PACKAGES=()
+ALLOW_ROOT_VERIFY=0
 EFI_BIN=""
 MCOPY_BIN=""
 MDIR_BIN=""
@@ -236,6 +237,7 @@ resolve_partuuid_device() {
 
 detect_current_efistub() {
     local output current_id line current_line="" active="0" loader="" opts="" partuuid="" base="" pattern hd_pattern raw_tail first_token trimmed_loader device fstype normalized_loader loader_info_file loader_info
+    local scan_str chunk byte_hex byte_val ch hex_clean decoded_opts ascii_decoded utf16_pairs ascii_pairs idx
     EFISTUB_STATUS="Not verified"
     EFISTUB_REASON=""
     EFISTUB_PARTUUID=""
@@ -248,7 +250,7 @@ detect_current_efistub() {
     loader_info_file="/sys/firmware/efi/efivars/LoaderInfo-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
     if [[ -r "$loader_info_file" ]]; then
         loader_info="$(tr -d '\0' < "$loader_info_file" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
-        if [[ "$loader_info" == *systemd-boot* || "$loader_info" == *grub* || "$loader_info" == *refind* ]]; then
+        if [[ "$loader_info" == *systemd-boot* || "$loader_info" == *grub* || "$loader_info" == *refind* || "$loader_info" == *clover* || "$loader_info" == *opencore* ]]; then
             EFISTUB_REASON="The current boot path uses a boot manager or chainloader instead of direct EFISTUB."
             return 1
         fi
@@ -261,6 +263,9 @@ detect_current_efistub() {
     output="$("$EFI_BIN" -v 2>/dev/null || true)"
     if [[ -z "$output" && EUID -ne 0 ]]; then
         output="$(sudo -n "$EFI_BIN" -v 2>/dev/null || true)"
+        if [[ -z "$output" ]] && (( ALLOW_ROOT_VERIFY == 1 )); then
+            output="$(run_root "$EFI_BIN" -v 2>/dev/null || true)"
+        fi
     fi
     current_id="$(printf '%s\n' "$output" | awk -F': *' '/^BootCurrent:/ {gsub(/[^0-9A-Fa-f]/, "", $2); print toupper($2); exit}')"
     if [[ ! "$current_id" =~ ^[[:xdigit:]]{4}$ ]]; then
@@ -288,32 +293,113 @@ detect_current_efistub() {
         if [[ "$raw_tail" == *$'\t'* ]]; then
             loader="${raw_tail%%$'\t'*}"
             opts="${raw_tail#*$'\t'}"
-        elif [[ "$raw_tail" =~ ^(.+\.[Ee][Ff][Ii])([[:space:]]+(.*))?$ ]]; then
+        elif [[ "$raw_tail" =~ ^(.+\.([Ee][Ff][Ii]|[Uu][Kk][Ii]))([^/]*)$ ]]; then
             loader="${BASH_REMATCH[1]}"
             opts="${BASH_REMATCH[3]:-}"
         else
-            if [[ "$raw_tail" =~ ^([^[:space:]]+)[[:space:]]*(.*)$ ]]; then
-                first_token="${BASH_REMATCH[1]}"
-                opts="${BASH_REMATCH[2]:-}"
-            else
-                first_token="$raw_tail"
-                opts=""
+            scan_str="$raw_tail"
+            if [[ "$scan_str" =~ ^(.*)(0000)$ ]]; then
+                scan_str="${BASH_REMATCH[1]}"
             fi
-            if [[ "$raw_tail" =~ ^(.+)[[:space:]]+([A-Za-z0-9_.-]+=.*|rw|ro|quiet|splash|--)(.*)$ ]]; then
-                trimmed_loader="${BASH_REMATCH[1]}"
-                if [[ "$trimmed_loader" != *"="* ]]; then
-                    loader="$trimmed_loader"
-                    opts="${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
+            utf16_pairs=0
+            while (( ${#scan_str} >= 4 )); do
+                chunk="${scan_str: -4}"
+                if [[ "$chunk" =~ ^(09|0[aAdD]|[2-7][0-9a-fA-F])00$ ]]; then
+                    scan_str="${scan_str:0:${#scan_str}-4}"
+                    utf16_pairs=$((utf16_pairs + 1))
                 else
-                    loader="$first_token"
+                    break
                 fi
-            elif [[ "$raw_tail" != *"="* ]]; then
-                loader="${raw_tail%"${raw_tail##*[![:space:]]}"}"
-                opts=""
+            done
+            if (( utf16_pairs >= 3 && ${#scan_str} >= 1 )); then
+                loader="$scan_str"
+                opts="${raw_tail:${#scan_str}}"
             else
-                loader="$first_token"
+                scan_str="$raw_tail"
+                if [[ "$scan_str" =~ ^(.*)(00)$ ]]; then
+                    scan_str="${BASH_REMATCH[1]}"
+                fi
+                ascii_pairs=0
+                ascii_decoded=""
+                while (( ${#scan_str} >= 2 )); do
+                    byte_hex="${scan_str: -2}"
+                    if [[ "$byte_hex" =~ ^(09|0a|0d|[2-7][0-9a-f])$ ]]; then
+                        scan_str="${scan_str:0:${#scan_str}-2}"
+                        byte_val=$((16#$byte_hex))
+                        if (( byte_val >= 32 && byte_val <= 126 )); then
+                            printf -v ch "\\x$byte_hex"
+                            ascii_decoded="${ch}${ascii_decoded}"
+                        else
+                            ascii_decoded=" ${ascii_decoded}"
+                        fi
+                        ascii_pairs=$((ascii_pairs + 1))
+                    else
+                        break
+                    fi
+                done
+                if (( ascii_pairs >= 6 && ${#scan_str} >= 1 )) && [[ "$ascii_decoded" =~ (^|[[:space:]])([A-Za-z0-9_.-]+=[^[:space:]]+|rw|ro|quiet|splash|debug|single|rescue|emergency|nomodeset|nowatchdog|--)([[:space:]]|$) ]]; then
+                    loader="$scan_str"
+                    opts="${raw_tail:${#scan_str}}"
+                elif [[ "$raw_tail" =~ ^([^[:space:]]+)[[:space:]]*(.*)$ ]]; then
+                    first_token="${BASH_REMATCH[1]}"
+                    opts="${BASH_REMATCH[2]:-}"
+                    if [[ "$raw_tail" =~ ^(.+)[[:space:]]+([A-Za-z0-9_.-]+=.*|rw|ro|quiet|splash|debug|single|rescue|emergency|nomodeset|nowatchdog|--)(.*)$ ]]; then
+                        trimmed_loader="${BASH_REMATCH[1]}"
+                        if [[ "$trimmed_loader" != *"="* ]]; then
+                            loader="$trimmed_loader"
+                            opts="${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
+                        else
+                            loader="$first_token"
+                        fi
+                    elif [[ "$raw_tail" != *"="* ]]; then
+                        loader="${raw_tail%"${raw_tail##*[![:space:]]}"}"
+                        opts=""
+                    else
+                        loader="$first_token"
+                    fi
+                else
+                    loader="$raw_tail"
+                    opts=""
+                fi
             fi
         fi
+    fi
+    opts="${opts#"${opts%%[![:space:]]*}"}"
+    opts="${opts%"${opts##*[![:space:]]}"}"
+    if [[ "$opts" =~ ^(([0-9a-fA-F]{2}00)+)([0-9a-fA-F]{2})?$ ]]; then
+        hex_clean="${BASH_REMATCH[1],,}"
+        decoded_opts=""
+        for ((idx = 0; idx < ${#hex_clean}; idx += 4)); do
+            byte_hex="${hex_clean:idx:2}"
+            [[ "$byte_hex" == "00" ]] && continue
+            byte_val=$((16#$byte_hex))
+            if (( byte_val >= 32 && byte_val <= 126 )); then
+                printf -v ch "\\x$byte_hex"
+                decoded_opts+="$ch"
+            elif (( byte_val == 9 || byte_val == 10 || byte_val == 13 )); then
+                decoded_opts+=" "
+            fi
+        done
+        decoded_opts="${decoded_opts#"${decoded_opts%%[![:space:]]*}"}"
+        decoded_opts="${decoded_opts%"${decoded_opts##*[![:space:]]}"}"
+        opts="$decoded_opts"
+    elif [[ "$opts" =~ ^(([0-9a-fA-F]{2}){4,})$ ]]; then
+        hex_clean="${BASH_REMATCH[1],,}"
+        decoded_opts=""
+        for ((idx = 0; idx < ${#hex_clean}; idx += 2)); do
+            byte_hex="${hex_clean:idx:2}"
+            [[ "$byte_hex" == "00" ]] && continue
+            byte_val=$((16#$byte_hex))
+            if (( byte_val >= 32 && byte_val <= 126 )); then
+                printf -v ch "\\x$byte_hex"
+                decoded_opts+="$ch"
+            elif (( byte_val == 9 || byte_val == 10 || byte_val == 13 )); then
+                decoded_opts+=" "
+            fi
+        done
+        decoded_opts="${decoded_opts#"${decoded_opts%%[![:space:]]*}"}"
+        decoded_opts="${decoded_opts%"${decoded_opts##*[![:space:]]}"}"
+        opts="$decoded_opts"
     fi
     if [[ "$current_line" =~ [Gg][Pp][Tt],([[:xdigit:]-]{36}) ]]; then
         partuuid="${BASH_REMATCH[1]}"
@@ -337,14 +423,14 @@ detect_current_efistub() {
         fstype="$(blkid -o value -s TYPE "$device" 2>/dev/null | head -n 1 || true)"
     fi
     case "${fstype,,}" in
-        vfat|fat|fat32) ;;
+        vfat|fat|fat32|msdos) ;;
         *)
             EFISTUB_REASON="The current EFI-stub image is not on a recognized FAT EFI partition. Detected filesystem: ${fstype:-unknown}."
             return 1
             ;;
     esac
     case "$base" in
-        shim*.efi|grub*.efi|refind*.efi|systemd-boot*.efi|bootx64.efi|bootaa64.efi|bootia32.efi|bootmgfw.efi|boot.efi|opencore*.efi|clover*.efi)
+        shim*.efi|grub*.efi|refind*.efi|systemd-boot*.efi|bootx64.efi|bootaa64.efi|bootia32.efi|bootmgfw.efi|bootmgr.efi|boot.efi|opencore*.efi|clover*.efi|fwupd*.efi|mmx64.efi|mmaa64.efi|mokmanager*.efi|shell*.efi|memtest*.efi)
             EFISTUB_REASON="The current boot path uses a boot manager or chainloader instead of direct EFISTUB."
             return 1
             ;;
@@ -399,60 +485,88 @@ inspect_pe_sections() {
 }
 
 verify_current_efistub_file() {
-    local device relative temporary size pe_offset pe_signature setup_magic zboot_magic arm64_magic riscv_magic zboot_comp kernel_offset kernel_version mnt loaded_from_mount=0 sections strings_dump cmdline_now opt_token matched_opts=0 resolved_mount_file part found linux_sec_line linux_ptr linux_size inner_setup_magic inner_zboot_magic inner_arm64_magic inner_riscv_magic
-    local -a parts=()
+    local device real_device relative temporary size pe_offset pe_signature pe_opt_magic pe_subsystem setup_magic zboot_magic arm64_magic riscv_magic zboot_comp kernel_offset kernel_version running_kernel mnt mnt_fstype loaded_from_mount=0 sections strings_dump cmdline_now opt_token matched_opts=0 resolved_mount_file part found linux_sec_line linux_ptr linux_size inner_setup_magic inner_zboot_magic inner_arm64_magic inner_riscv_magic
+    local -a parts=() mount_candidates=()
     device="$(resolve_partuuid_device "$EFISTUB_PARTUUID" || true)"
+    real_device="$(readlink -f "$device" 2>/dev/null || printf '%s' "$device")"
     relative="${EFISTUB_LOADER//\\//}"
     while [[ "$relative" == *"//"* ]]; do
         relative="${relative//\/\//\/}"
     done
     relative="${relative#/}"
-    [[ -b "$device" && -n "$relative" ]] || return 1
+    [[ -b "$real_device" && -n "$relative" ]] || return 1
     [[ "$relative" =~ ^[A-Za-z0-9._/+@\ -]+$ ]] || return 1
     case "/$relative/" in
         */../*) return 1 ;;
     esac
     temporary="$(mktemp)" || return 1
-    mnt="$(findmnt -rn -o TARGET "$device" 2>/dev/null | head -n 1 || true)"
-    if [[ -n "$mnt" && -d "$mnt" ]]; then
-        if [[ -r "$mnt/$relative" ]]; then
-            if cp -f "$mnt/$relative" "$temporary" 2>/dev/null; then
-                loaded_from_mount=1
+    if command -v findmnt >/dev/null 2>&1; then
+        while IFS=$'\t' read -r mnt_fstype mnt; do
+            [[ -n "$mnt" && -d "$mnt" ]] || continue
+            case "${mnt_fstype,,}" in
+                vfat|fat|fat32|msdos) mount_candidates=("$mnt" "${mount_candidates[@]}") ;;
+                *) mount_candidates+=("$mnt") ;;
+            esac
+        done < <(findmnt -rn -S "$real_device" -o FSTYPE,TARGET 2>/dev/null || true)
+    fi
+    for mnt in "${mount_candidates[@]}"; do
+        if [[ -r "$mnt/$relative" ]] && cp -f "$mnt/$relative" "$temporary" 2>/dev/null; then
+            loaded_from_mount=1
+            break
+        fi
+        resolved_mount_file="$mnt"
+        IFS='/' read -ra parts <<< "$relative"
+        for part in "${parts[@]}"; do
+            [[ -z "$part" ]] && continue
+            found="$(find "$resolved_mount_file" -mindepth 1 -maxdepth 1 -iname "$part" -print -quit 2>/dev/null || true)"
+            if [[ -z "$found" ]]; then
+                resolved_mount_file=""
+                break
             fi
-        else
+            resolved_mount_file="$found"
+        done
+        if [[ -n "$resolved_mount_file" && -r "$resolved_mount_file" ]] && cp -f "$resolved_mount_file" "$temporary" 2>/dev/null; then
+            loaded_from_mount=1
+            break
+        fi
+        if (( ALLOW_ROOT_VERIFY == 1 && EUID != 0 )); then
+            if run_root test -r "$mnt/$relative" 2>/dev/null && run_root cat "$mnt/$relative" > "$temporary" 2>/dev/null; then
+                loaded_from_mount=1
+                break
+            fi
             resolved_mount_file="$mnt"
-            IFS='/' read -ra parts <<< "$relative"
             for part in "${parts[@]}"; do
                 [[ -z "$part" ]] && continue
-                found="$(find "$resolved_mount_file" -maxdepth 1 -iname "$part" 2>/dev/null | head -n 1 || true)"
+                found="$(run_root find "$resolved_mount_file" -mindepth 1 -maxdepth 1 -iname "$part" -print -quit 2>/dev/null || true)"
                 if [[ -z "$found" ]]; then
                     resolved_mount_file=""
                     break
                 fi
                 resolved_mount_file="$found"
             done
-            if [[ -n "$resolved_mount_file" && -r "$resolved_mount_file" ]]; then
-                if cp -f "$resolved_mount_file" "$temporary" 2>/dev/null; then
-                    loaded_from_mount=1
-                fi
+            if [[ -n "$resolved_mount_file" ]] && run_root test -r "$resolved_mount_file" 2>/dev/null && run_root cat "$resolved_mount_file" > "$temporary" 2>/dev/null; then
+                loaded_from_mount=1
+                break
             fi
         fi
-    fi
+    done
     if (( loaded_from_mount == 0 )); then
         if (( EUID == 0 )); then
-            if ! MTOOLS_SKIP_CHECK=1 "$MCOPY_BIN" -n -i "$device" "::/$relative" - > "$temporary" 2>/dev/null; then
+            if ! MTOOLS_SKIP_CHECK=1 "$MCOPY_BIN" -n -i "$real_device" "::/$relative" - > "$temporary" 2>/dev/null; then
                 rm -f "$temporary"
                 EFISTUB_REASON="The current EFI-stub image '${EFISTUB_LOADER}' could not be read from PARTUUID=${EFISTUB_PARTUUID}."
                 return 1
             fi
-        elif [[ -x "$HELPER_PATH" ]]; then
-            if ! sudo -n "$HELPER_PATH" read "$EFISTUB_PARTUUID" "$relative" > "$temporary" 2>/dev/null; then
+        elif [[ -x "$HELPER_PATH" ]] && sudo -n "$HELPER_PATH" read "$EFISTUB_PARTUUID" "$relative" > "$temporary" 2>/dev/null; then
+            :
+        elif (( ALLOW_ROOT_VERIFY == 1 )); then
+            if ! run_root env MTOOLS_SKIP_CHECK=1 "$MCOPY_BIN" -n -i "$real_device" "::/$relative" - > "$temporary" 2>/dev/null; then
                 rm -f "$temporary"
-                EFISTUB_REASON="The current EFI-stub image '${EFISTUB_LOADER}' could not be read through the privileged EFI reader helper."
+                EFISTUB_REASON="The current EFI-stub image '${EFISTUB_LOADER}' could not be read from PARTUUID=${EFISTUB_PARTUUID}."
                 return 1
             fi
         else
-            if ! sudo -n env MTOOLS_SKIP_CHECK=1 "$MCOPY_BIN" -n -i "$device" "::/$relative" - > "$temporary" 2>/dev/null; then
+            if ! sudo -n env MTOOLS_SKIP_CHECK=1 "$MCOPY_BIN" -n -i "$real_device" "::/$relative" - > "$temporary" 2>/dev/null; then
                 rm -f "$temporary"
                 EFISTUB_REASON="The current EFI-stub image '${EFISTUB_LOADER}' could not be read from PARTUUID=${EFISTUB_PARTUUID} without a password prompt."
                 return 1
@@ -471,7 +585,7 @@ verify_current_efistub_file() {
         return 1
     fi
     pe_offset="$(read_u32_le "$temporary" 60 || printf '0')"
-    if (( pe_offset < 64 || pe_offset + 24 > size )); then
+    if (( pe_offset < 64 || pe_offset + 96 > size )); then
         rm -f "$temporary"
         EFISTUB_REASON="The current EFI image has an invalid or out-of-range PE header offset."
         return 1
@@ -480,6 +594,18 @@ verify_current_efistub_file() {
     if [[ "$pe_signature" != "50450000" ]]; then
         rm -f "$temporary"
         EFISTUB_REASON="The current EFI image does not contain a valid PE/COFF signature."
+        return 1
+    fi
+    pe_opt_magic="$(read_u16_le "$temporary" $((pe_offset + 24)) || printf '0')"
+    if (( pe_opt_magic != 523 && pe_opt_magic != 267 )); then
+        rm -f "$temporary"
+        EFISTUB_REASON="The current EFI image does not have a valid PE32/PE32+ optional header."
+        return 1
+    fi
+    pe_subsystem="$(read_u16_le "$temporary" $((pe_offset + 24 + 68)) || printf '0')"
+    if (( pe_subsystem != 10 )); then
+        rm -f "$temporary"
+        EFISTUB_REASON="The current PE image is not a UEFI application (subsystem ${pe_subsystem})."
         return 1
     fi
     sections="$(inspect_pe_sections "$temporary" "$pe_offset" "$size")"
@@ -550,7 +676,7 @@ verify_current_efistub_file() {
         kernel_version="$(uname -r)"
     else
         strings_dump="$(tr -d '\000' < "$temporary" 2>/dev/null || true)"
-        if printf '%s' "$strings_dump" | grep -aEq 'GNU GRUB|grub_efi_|rEFInd|systemd-boot|shim_lock|bootmgfw\.pdb'; then
+        if printf '%s' "$strings_dump" | grep -aEq 'GNU GRUB|grub_efi_|rEFInd|systemd-boot|shim_lock|bootmgfw\.pdb|OpenCore|Clover'; then
             rm -f "$temporary"
             EFISTUB_REASON="The current PE image is a boot manager or chainloader, not a direct Linux EFISTUB kernel image."
             return 1
@@ -576,8 +702,15 @@ verify_current_efistub_file() {
         fi
     fi
     rm -f "$temporary"
+    running_kernel="$(uname -r 2>/dev/null || true)"
     EFISTUB_STATUS="Confirmed"
-    EFISTUB_REASON="BootCurrent resolves to a readable Linux EFI-stub image (${kernel_version}) at ${EFISTUB_LOADER} on PARTUUID=${EFISTUB_PARTUUID}."
+    if [[ -n "$running_kernel" && "$kernel_version" == "$running_kernel" ]]; then
+        EFISTUB_REASON="BootCurrent resolves to the running Linux EFI-stub kernel (${kernel_version}) at ${EFISTUB_LOADER} on PARTUUID=${EFISTUB_PARTUUID}."
+    elif [[ -n "$running_kernel" ]]; then
+        EFISTUB_REASON="BootCurrent resolves to a valid Linux EFI-stub kernel (${kernel_version}; currently running ${running_kernel}) at ${EFISTUB_LOADER} on PARTUUID=${EFISTUB_PARTUUID}."
+    else
+        EFISTUB_REASON="BootCurrent resolves to a readable Linux EFI-stub image (${kernel_version}) at ${EFISTUB_LOADER} on PARTUUID=${EFISTUB_PARTUUID}."
+    fi
     return 0
 }
 
@@ -1150,9 +1283,12 @@ do_install() {
         fi
         sudo -v || return 1
     fi
+    ALLOW_ROOT_VERIFY=1
     if ! prepare_dependencies; then
+        ALLOW_ROOT_VERIFY=0
         return 1
     fi
+    ALLOW_ROOT_VERIFY=0
     say "${GREEN}[+] EFISTUB requirement passed.${RESET}"
     backup_dir="$(mktemp -d)" || return 1
     if run_root test -f "$HELPER_PATH" 2>/dev/null && run_root cat "$HELPER_PATH" > "$backup_dir/helper" 2>/dev/null; then
