@@ -182,7 +182,7 @@ Automatically detects and classifies standard, distribution, and custom-compiled
 Running `./install.sh` presents a guided terminal management interface:
 1. **`Install`** — Runs full pre-flight EFISTUB checks, installs dependencies, deploys `/usr/local/bin/boot`, builds the privilege-separated EFI reader helper, configures `sudoers`, and injects shell completions.
 2. **`Uninstall`** — Cleanly removes all installed binaries, `sudoers` rules, and installer-added shell configuration lines using the installation manifest.
-3. **`Reinstall`** — Performs a clean teardown of existing artifacts followed by a fresh installation.
+3. **`Status`** — Displays current installation state, core binary and `sudoers` health, EFISTUB verification status, and detected boot targets.
 4. **`Repair`** — Re-validates EFISTUB prerequisites, regenerates `/usr/local/bin/boot`, `/usr/local/libexec/multiboot-efi-read`, `/etc/sudoers.d/multiboot` (via `visudo`), and restores any missing shell completions.
 5. **`Exit`** — Exits cleanly without making changes.
 
@@ -332,7 +332,7 @@ Before setting `BootNext` or rebooting, `verify_target` validates:
 ## Quick Installation
 
 ```bash
-git clone https://github.com/plopletoyay/multi-boot.git
+git clone [https://github.com/plopletoyay/multi-boot.git](https://github.com/plopletoyay/multi-boot.git)
 cd multi-boot
 chmod +x boot install.sh
 ./install.sh
@@ -348,14 +348,14 @@ Select option **`1) Install`** from the interactive menu.
 ========================================
   1) Install
   2) Uninstall
-  3) Reinstall
+  3) Status
   4) Repair
   5) Exit
 ```
 
 - **`1) Install`:** Validates Direct EFISTUB environment, installs dependencies, installs `/usr/local/bin/boot`, builds `/usr/local/libexec/multiboot-efi-read`, configures `/etc/sudoers.d/multiboot` via `visudo`, and enables tab-completion for your detected shells.
 - **`2) Uninstall`:** Reads `/var/lib/multiboot/install.manifest` to remove installed files and strip only the shell completion blocks added by the installer.
-- **`3) Reinstall`:** Runs a clean uninstall followed by a fresh installation.
+- **`3) Status`:** Checks overall installation state, verifies `/usr/local/bin/boot`, `/usr/local/libexec/multiboot-efi-read`, `/etc/sudoers.d/multiboot`, dependency availability, Direct EFISTUB status, and lists detected boot targets.
 - **`4) Repair`:** Re-runs EFISTUB validation, overwrites `/usr/local/bin/boot` and `/usr/local/libexec/multiboot-efi-read` with clean copies, re-validates `/etc/sudoers.d/multiboot`, and repairs shell completion hooks.
 
 ---
