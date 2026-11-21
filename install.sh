@@ -54,6 +54,7 @@ SYSTEMCTL_BIN=""
 BOOTCTL_BIN=""
 REBOOT_BIN=""
 VISUDO_BIN=""
+BOOT_MODE=""
 EFISTUB_STATUS="Not verified"
 EFISTUB_REASON=""
 EFISTUB_PARTUUID=""
@@ -196,56 +197,15 @@ resolve_partuuid_device() {
     return 1
 }
 
-detect_current_efistub() {
-    local output current_id line current_line="" active="0" loader="" opts="" partuuid="" base="" pattern hd_pattern raw_tail first_token trimmed_loader device fstype normalized_loader loader_info_file loader_info
-    EFISTUB_STATUS="Not verified"
-    EFISTUB_REASON=""
-    EFISTUB_PARTUUID=""
-    EFISTUB_LOADER=""
-    EFISTUB_OPTS=""
-    if [[ ! -d /sys/firmware/efi || ! -d /sys/firmware/efi/efivars ]]; then
-        EFISTUB_REASON="The system is not currently booted in UEFI mode."
-        return 1
-    fi
-    loader_info_file="/sys/firmware/efi/efivars/LoaderInfo-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
-    if [[ -r "$loader_info_file" ]]; then
-        loader_info="$(tr -d '\0' < "$loader_info_file" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
-        if [[ "$loader_info" == *systemd-boot* || "$loader_info" == *grub* || "$loader_info" == *refind* ]]; then
-            EFISTUB_REASON="The current boot path uses a boot manager or chainloader instead of direct EFISTUB."
-            return 1
-        fi
-    fi
-    EFI_BIN="$(resolve_binary efibootmgr 2>/dev/null || true)"
-    if [[ -z "$EFI_BIN" ]]; then
-        EFISTUB_REASON="efibootmgr is unavailable, so the current firmware boot path cannot be verified."
-        return 1
-    fi
-    output="$("$EFI_BIN" -v 2>/dev/null || true)"
-    if [[ -z "$output" && EUID -ne 0 ]]; then
-        output="$(sudo -n "$EFI_BIN" -v 2>/dev/null || true)"
-    fi
-    current_id="$(printf '%s\n' "$output" | awk -F': *' '/^BootCurrent:/ {gsub(/[^0-9A-Fa-f]/, "", $2); print toupper($2); exit}')"
-    if [[ ! "$current_id" =~ ^[[:xdigit:]]{4}$ ]]; then
-        EFISTUB_REASON="The firmware did not report a readable BootCurrent entry."
-        return 1
-    fi
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^Boot${current_id}(\*)?[[:space:]]*(.*)$ ]]; then
-            current_line="$line"
-            [[ -n "${BASH_REMATCH[1]:-}" ]] && active="1"
-            break
-        fi
-    done <<< "$output"
-    if [[ -z "$current_line" || "$active" != "1" ]]; then
-        EFISTUB_REASON="The current firmware entry Boot${current_id} could not be verified as active."
-        return 1
-    fi
-    pattern='File\(([^)]*)\)(.*)$'
-    hd_pattern='HD\([^)]*\)/([\\/].*)$'
-    if [[ "$current_line" =~ $pattern ]]; then
+extract_entry_loader_and_opts() {
+    local entry_line="$1"
+    local loader="" opts="" raw_tail="" first_token="" trimmed_loader=""
+    local pattern='File\(([^)]*)\)(.*)$'
+    local hd_pattern='HD\([^)]*\)/([\\/].*)$'
+    if [[ "$entry_line" =~ $pattern ]]; then
         loader="${BASH_REMATCH[1]}"
         opts="${BASH_REMATCH[2]:-}"
-    elif [[ "$current_line" =~ $hd_pattern ]]; then
+    elif [[ "$entry_line" =~ $hd_pattern ]]; then
         raw_tail="${BASH_REMATCH[1]}"
         if [[ "$raw_tail" == *$'\t'* ]]; then
             loader="${raw_tail%%$'\t'*}"
@@ -277,8 +237,121 @@ detect_current_efistub() {
             fi
         fi
     fi
+    printf '%s\t%s' "$loader" "$opts"
+}
+
+detect_current_efistub() {
+    local output current_id line current_line="" active="0" loader="" opts="" partuuid="" base="" device fstype normalized_loader loader_info_file loader_info="" is_sdboot_info=0 parsed_pair sdboot_line="" sdboot_id=""
+    BOOT_MODE=""
+    EFISTUB_STATUS="Not verified"
+    EFISTUB_REASON=""
+    EFISTUB_PARTUUID=""
+    EFISTUB_LOADER=""
+    EFISTUB_OPTS=""
+    if [[ ! -d /sys/firmware/efi || ! -d /sys/firmware/efi/efivars ]]; then
+        EFISTUB_REASON="The system is not currently booted in UEFI mode."
+        return 1
+    fi
+    loader_info_file="/sys/firmware/efi/efivars/LoaderInfo-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
+    if [[ -r "$loader_info_file" ]]; then
+        loader_info="$(tr -d '\0' < "$loader_info_file" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+        if [[ "$loader_info" == *systemd-boot* ]]; then
+            is_sdboot_info=1
+        elif [[ "$loader_info" == *grub* || "$loader_info" == *refind* ]]; then
+            EFISTUB_REASON="The current boot path uses an unsupported boot manager or chainloader instead of direct EFISTUB or systemd-boot."
+            return 1
+        fi
+    fi
+    EFI_BIN="$(resolve_binary efibootmgr 2>/dev/null || true)"
+    if [[ -z "$EFI_BIN" ]]; then
+        EFISTUB_REASON="efibootmgr is unavailable, so the current firmware boot path cannot be verified."
+        return 1
+    fi
+    output="$("$EFI_BIN" -v 2>/dev/null || true)"
+    if [[ -z "$output" && EUID -ne 0 ]]; then
+        output="$(sudo -n "$EFI_BIN" -v 2>/dev/null || true)"
+    fi
+    current_id="$(printf '%s\n' "$output" | awk -F': *' '/^BootCurrent:/ {gsub(/[^0-9A-Fa-f]/, "", $2); print toupper($2); exit}')"
+    if [[ ! "$current_id" =~ ^[[:xdigit:]]{4}$ ]]; then
+        EFISTUB_REASON="The firmware did not report a readable BootCurrent entry."
+        return 1
+    fi
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^Boot${current_id}(\*)?[[:space:]]*(.*)$ ]]; then
+            current_line="$line"
+            [[ -n "${BASH_REMATCH[1]:-}" ]] && active="1"
+            break
+        fi
+    done <<< "$output"
+    if [[ -z "$current_line" || "$active" != "1" ]]; then
+        EFISTUB_REASON="The current firmware entry Boot${current_id} could not be verified as active."
+        return 1
+    fi
+    parsed_pair="$(extract_entry_loader_and_opts "$current_line")"
+    loader="${parsed_pair%%$'\t'*}"
+    opts="${parsed_pair#*$'\t'}"
     if [[ "$current_line" =~ [Gg][Pp][Tt],([[:xdigit:]-]{36}) ]]; then
         partuuid="${BASH_REMATCH[1]}"
+    fi
+    loader="${loader//\\//}"
+    while [[ "$loader" == *"//"* ]]; do
+        loader="${loader//\/\//\/}"
+    done
+    normalized_loader="${loader,,}"
+    base="${normalized_loader##*/}"
+    if [[ "$base" == systemd-bootx64.efi || "$base" == systemd-bootaa64.efi || "$base" == systemd-bootia32.efi || "$is_sdboot_info" == "1" ]]; then
+        if [[ "$base" != systemd-bootx64.efi && "$base" != systemd-bootaa64.efi && "$base" != systemd-bootia32.efi ]]; then
+            while IFS= read -r line; do
+                if [[ "$line" =~ ^Boot([[:xdigit:]]{4})\*[[:space:]]+.*[Ss][Yy][Ss][Tt][Ee][Mm][Dd]-[Bb][Oo][Oo][Tt]([Xx]64|[Aa][Aa]64|[Ii][Aa]32)\.[Ee][Ff][Ii] ]]; then
+                    sdboot_id="${BASH_REMATCH[1]^^}"
+                    sdboot_line="$line"
+                    break
+                fi
+            done <<< "$output"
+            if [[ -z "$sdboot_line" ]]; then
+                EFISTUB_REASON="systemd-boot is active, but no active UEFI NVRAM entry for systemd-boot was found."
+                return 1
+            fi
+            current_id="$sdboot_id"
+            current_line="$sdboot_line"
+            parsed_pair="$(extract_entry_loader_and_opts "$current_line")"
+            loader="${parsed_pair%%$'\t'*}"
+            opts="${parsed_pair#*$'\t'}"
+            loader="${loader//\\//}"
+            while [[ "$loader" == *"//"* ]]; do
+                loader="${loader//\/\//\/}"
+            done
+            partuuid=""
+            if [[ "$current_line" =~ [Gg][Pp][Tt],([[:xdigit:]-]{36}) ]]; then
+                partuuid="${BASH_REMATCH[1]}"
+            fi
+        fi
+        device=""
+        if [[ -n "$partuuid" ]]; then
+            device="$(resolve_partuuid_device "$partuuid" || true)"
+        fi
+        if [[ -z "$loader" || -z "$partuuid" || -z "$device" ]]; then
+            EFISTUB_REASON="Boot${current_id} does not resolve to an existing GPT-backed systemd-boot EFI image."
+            return 1
+        fi
+        fstype="$(lsblk -dnro FSTYPE "$device" 2>/dev/null | head -n 1 || true)"
+        if [[ -z "$fstype" ]]; then
+            fstype="$(blkid -o value -s TYPE "$device" 2>/dev/null | head -n 1 || true)"
+        fi
+        case "${fstype,,}" in
+            vfat|fat|fat32) ;;
+            *)
+                EFISTUB_REASON="The systemd-boot image is not on a recognized FAT EFI partition. Detected filesystem: ${fstype:-unknown}."
+                return 1
+                ;;
+        esac
+        BOOT_MODE="systemd-boot"
+        EFISTUB_PARTUUID="${partuuid,,}"
+        EFISTUB_LOADER="$loader"
+        EFISTUB_OPTS="$opts"
+        EFISTUB_STATUS="Preliminary"
+        EFISTUB_REASON="Boot${current_id} points to systemd-boot (${loader}) on PARTUUID=${partuuid}."
+        return 0
     fi
     device=""
     if [[ -n "$partuuid" ]]; then
@@ -288,12 +361,6 @@ detect_current_efistub() {
         EFISTUB_REASON="Boot${current_id} does not resolve to an existing GPT-backed EFI image."
         return 1
     fi
-    loader="${loader//\\//}"
-    while [[ "$loader" == *"//"* ]]; do
-        loader="${loader//\/\//\/}"
-    done
-    normalized_loader="${loader,,}"
-    base="${normalized_loader##*/}"
     fstype="$(lsblk -dnro FSTYPE "$device" 2>/dev/null | head -n 1 || true)"
     if [[ -z "$fstype" ]]; then
         fstype="$(blkid -o value -s TYPE "$device" 2>/dev/null | head -n 1 || true)"
@@ -307,10 +374,11 @@ detect_current_efistub() {
     esac
     case "$base" in
         shim*.efi|grub*.efi|refind*.efi|systemd-boot*.efi|bootx64.efi|bootaa64.efi|bootia32.efi|bootmgfw.efi|boot.efi|opencore*.efi|clover*.efi)
-            EFISTUB_REASON="The current boot path uses a boot manager or chainloader instead of direct EFISTUB."
+            EFISTUB_REASON="The current boot path uses a boot manager or chainloader instead of direct EFISTUB or systemd-boot."
             return 1
             ;;
     esac
+    BOOT_MODE="efistub"
     EFISTUB_PARTUUID="${partuuid,,}"
     EFISTUB_LOADER="$loader"
     EFISTUB_OPTS="$opts"
@@ -404,19 +472,19 @@ verify_current_efistub_file() {
         if (( EUID == 0 )); then
             if ! MTOOLS_SKIP_CHECK=1 "$MCOPY_BIN" -n -i "$device" "::/$relative" - > "$temporary" 2>/dev/null; then
                 rm -f "$temporary"
-                EFISTUB_REASON="The current EFI-stub image '${EFISTUB_LOADER}' could not be read from PARTUUID=${EFISTUB_PARTUUID}."
+                EFISTUB_REASON="The current EFI image '${EFISTUB_LOADER}' could not be read from PARTUUID=${EFISTUB_PARTUUID}."
                 return 1
             fi
         elif [[ -x "$HELPER_PATH" ]]; then
             if ! sudo -n "$HELPER_PATH" read "$EFISTUB_PARTUUID" "$relative" > "$temporary" 2>/dev/null; then
                 rm -f "$temporary"
-                EFISTUB_REASON="The current EFI-stub image '${EFISTUB_LOADER}' could not be read through the privileged EFI reader helper."
+                EFISTUB_REASON="The current EFI image '${EFISTUB_LOADER}' could not be read through the privileged EFI reader helper."
                 return 1
             fi
         else
             if ! sudo -n env MTOOLS_SKIP_CHECK=1 "$MCOPY_BIN" -n -i "$device" "::/$relative" - > "$temporary" 2>/dev/null; then
                 rm -f "$temporary"
-                EFISTUB_REASON="The current EFI-stub image '${EFISTUB_LOADER}' could not be read from PARTUUID=${EFISTUB_PARTUUID} without a password prompt."
+                EFISTUB_REASON="The current EFI image '${EFISTUB_LOADER}' could not be read from PARTUUID=${EFISTUB_PARTUUID} without a password prompt."
                 return 1
             fi
         fi
@@ -424,7 +492,7 @@ verify_current_efistub_file() {
     size="$(wc -c < "$temporary" | tr -d '[:space:]')"
     if [[ ! "$size" =~ ^[0-9]+$ ]] || (( size < 1024 )); then
         rm -f "$temporary"
-        EFISTUB_REASON="The current EFI-stub image is empty or too small to be a valid EFI executable."
+        EFISTUB_REASON="The current EFI image is empty or too small to be a valid EFI executable."
         return 1
     fi
     if [[ "$(od -An -tx1 -N2 "$temporary" 2>/dev/null | tr -d '[:space:]')" != "4d5a" ]]; then
@@ -443,6 +511,17 @@ verify_current_efistub_file() {
         rm -f "$temporary"
         EFISTUB_REASON="The current EFI image does not contain a valid PE/COFF signature."
         return 1
+    fi
+    if [[ "$BOOT_MODE" == "systemd-boot" ]]; then
+        strings_dump="$(tr -d '\000' < "$temporary" 2>/dev/null || true)"
+        rm -f "$temporary"
+        if ! printf '%s' "$strings_dump" | grep -aEq 'systemd-boot'; then
+            EFISTUB_REASON="The target EFI binary at ${EFISTUB_LOADER} could not be verified as systemd-boot."
+            return 1
+        fi
+        EFISTUB_STATUS="Confirmed"
+        EFISTUB_REASON="BootCurrent resolves to a readable systemd-boot binary at ${EFISTUB_LOADER} on PARTUUID=${EFISTUB_PARTUUID}."
+        return 0
     fi
     sections="$(inspect_pe_sections "$temporary" "$pe_offset" "$size")"
     setup_magic="$(od -An -tx1 -j514 -N4 "$temporary" 2>/dev/null | tr -d '[:space:]')"
@@ -560,9 +639,14 @@ prepare_dependencies() {
         return 1
     fi
     if ! detect_current_efistub; then
-        say "${RED}[!] EFISTUB verification failed: ${EFISTUB_REASON}${RESET}"
-        say "${RED}Multi Boot can only be installed while a Linux kernel is booted directly through EFISTUB. GRUB, rEFInd, shim, and systemd-boot are not accepted as the current boot path.${RESET}"
+        say "${RED}[!] Boot verification failed: ${EFISTUB_REASON}${RESET}"
+        say "${RED}Multi Boot can only be installed while booted via direct EFISTUB or systemd-boot. GRUB, rEFInd, and shim are not accepted as the current boot path.${RESET}"
         say "${RED}Installation stopped. No Multi Boot files or sudoers rules were changed.${RESET}"
+        return 1
+    fi
+    BOOTCTL_BIN="$(resolve_binary bootctl 2>/dev/null || true)"
+    if [[ "$BOOT_MODE" == "systemd-boot" && -z "$BOOTCTL_BIN" ]]; then
+        say "${RED}[!] bootctl is required for systemd-boot support, but it is unavailable. Installation stopped.${RESET}"
         return 1
     fi
     if ! install_package mtools; then
@@ -576,14 +660,17 @@ prepare_dependencies() {
         return 1
     fi
     if ! verify_current_efistub_file; then
-        say "${RED}[!] EFISTUB verification failed: ${EFISTUB_REASON}${RESET}"
-        say "${RED}Multi Boot only supports a directly loaded Linux EFISTUB kernel. Installation stopped. No Multi Boot files or sudoers rules were changed.${RESET}"
+        say "${RED}[!] Boot verification failed: ${EFISTUB_REASON}${RESET}"
+        say "${RED}Multi Boot only supports a verified direct EFISTUB kernel or systemd-boot manager. Installation stopped. No Multi Boot files or sudoers rules were changed.${RESET}"
         return 1
     fi
-    say "${GREEN}[+] Direct EFISTUB boot confirmed: ${EFISTUB_REASON}${RESET}"
+    if [[ "$BOOT_MODE" == "systemd-boot" ]]; then
+        say "${GREEN}[+] systemd-boot confirmed: ${EFISTUB_REASON}${RESET}"
+    else
+        say "${GREEN}[+] Direct EFISTUB boot confirmed: ${EFISTUB_REASON}${RESET}"
+    fi
     SYSTEMCTL_BIN="$(resolve_binary systemctl 2>/dev/null || true)"
     [[ -d /run/systemd/system ]] || SYSTEMCTL_BIN=""
-    BOOTCTL_BIN="$(resolve_binary bootctl 2>/dev/null || true)"
     REBOOT_BIN="$(resolve_binary reboot 2>/dev/null || true)"
     VISUDO_BIN="$(resolve_binary visudo 2>/dev/null || true)"
     if [[ -z "$VISUDO_BIN" ]]; then
@@ -989,7 +1076,7 @@ do_install() {
     if [[ "$action" == "repair" ]]; then
         say "${BLUE}[*] Preparing Multi Boot repair.${RESET}"
         first_confirmation="Repair Multi Boot for ${TARGET_USER}? (y/n)"
-        second_confirmation="This will replace the core command, revalidate EFISTUB, refresh passwordless UEFI permissions, and rebuild shell integrations. Continue? (y/n)"
+        second_confirmation="This will replace the core command, revalidate the boot path, refresh passwordless UEFI permissions, and rebuild shell integrations. Continue? (y/n)"
     else
         say "${BLUE}[*] Preparing Multi Boot installation.${RESET}"
         first_confirmation="Install Multi Boot for ${TARGET_USER}? (y/n)"
@@ -1012,7 +1099,7 @@ do_install() {
     if ! prepare_dependencies; then
         return 1
     fi
-    say "${GREEN}[+] EFISTUB requirement passed.${RESET}"
+    say "${GREEN}[+] Boot environment requirement passed.${RESET}"
     if ! create_efi_reader_helper; then
         say "${RED}[!] Failed to install the restricted EFI reader helper.${RESET}"
         return 1
@@ -1083,20 +1170,22 @@ do_remove() {
 }
 
 show_efistub_status() {
+    local label="EFISTUB"
     if ! detect_current_efistub; then
-        say "${RED}[!] EFISTUB: ${EFISTUB_REASON}${RESET}"
+        say "${RED}[!] Boot Path: ${EFISTUB_REASON}${RESET}"
         return 1
     fi
+    [[ "$BOOT_MODE" == "systemd-boot" ]] && label="systemd-boot"
     MCOPY_BIN="$(resolve_binary mcopy 2>/dev/null || true)"
     MDIR_BIN="$(resolve_binary mdir 2>/dev/null || true)"
     if [[ -z "$MCOPY_BIN" || -z "$MDIR_BIN" ]]; then
-        say "${YELLOW}[!] EFISTUB: ${EFISTUB_REASON} Image verification is unavailable because mtools is missing.${RESET}"
+        say "${YELLOW}[!] ${label}: ${EFISTUB_REASON} Image verification is unavailable because mtools is missing.${RESET}"
         return 0
     fi
     if verify_current_efistub_file; then
-        say "${GREEN}[+] EFISTUB: ${EFISTUB_REASON}${RESET}"
+        say "${GREEN}[+] ${label}: ${EFISTUB_REASON}${RESET}"
     else
-        say "${RED}[!] EFISTUB: ${EFISTUB_REASON}${RESET}"
+        say "${RED}[!] ${label}: ${EFISTUB_REASON}${RESET}"
         return 1
     fi
 }
