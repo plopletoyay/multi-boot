@@ -9,7 +9,43 @@ LIBEXEC_DIR=/usr/local/libexec
 HELPER_PATH="$LIBEXEC_DIR/multiboot-efi-read"
 SUDOERS_DIR=/etc/sudoers.d
 SUDOERS_PATH="$SUDOERS_DIR/efiboot-next"
-TARGET_USER="${SUDO_USER:-${USER:-$(id -un)}}"
+
+resolve_initial_target_user() {
+    local candidate="" login_uid=""
+    if (( EUID != 0 )); then
+        id -un 2>/dev/null || printf '%s' "${USER:-$EUID}"
+        return 0
+    fi
+    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" && "$SUDO_USER" != "0" ]]; then
+        printf '%s' "$SUDO_USER"
+        return 0
+    fi
+    if [[ -n "${DOAS_USER:-}" && "$DOAS_USER" != "root" && "$DOAS_USER" != "0" ]]; then
+        printf '%s' "$DOAS_USER"
+        return 0
+    fi
+    if [[ -n "${PKEXEC_UID:-}" && "$PKEXEC_UID" =~ ^[0-9]+$ && "$PKEXEC_UID" != "0" ]]; then
+        printf '%s' "$PKEXEC_UID"
+        return 0
+    fi
+    if command -v logname >/dev/null 2>&1; then
+        candidate="$(logname 2>/dev/null || true)"
+        if [[ -n "$candidate" && "$candidate" != "root" && "$candidate" != "0" ]]; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    fi
+    if [[ -r /proc/self/loginuid ]]; then
+        login_uid="$(tr -d '[:space:]' < /proc/self/loginuid 2>/dev/null || true)"
+        if [[ "$login_uid" =~ ^[0-9]+$ && "$login_uid" != "0" && "$login_uid" != "4294967295" ]]; then
+            printf '%s' "$login_uid"
+            return 0
+        fi
+    fi
+    printf '%s' "${USER:-$(id -un)}"
+}
+
+TARGET_USER="$(resolve_initial_target_user)"
 PASSWD_RECORD=""
 if command -v getent >/dev/null 2>&1; then
     PASSWD_RECORD="$(getent passwd "$TARGET_USER" 2>/dev/null || true)"
@@ -29,8 +65,17 @@ TARGET_USER="${PASSWD_RECORD%%:*}"
 TARGET_UID="$(printf '%s\n' "$PASSWD_RECORD" | cut -d: -f3)"
 TARGET_GID="$(printf '%s\n' "$PASSWD_RECORD" | cut -d: -f4)"
 TARGET_HOME="$(printf '%s\n' "$PASSWD_RECORD" | cut -d: -f6)"
-TARGET_GROUP="$(id -gn "$TARGET_USER" 2>/dev/null || printf '%s' "$TARGET_USER")"
+TARGET_SHELL="$(printf '%s\n' "$PASSWD_RECORD" | cut -d: -f7)"
+TARGET_GROUP="$(id -gn "$TARGET_USER" 2>/dev/null || true)"
+if [[ -z "$TARGET_GROUP" ]] && command -v getent >/dev/null 2>&1; then
+    TARGET_GROUP="$(getent group "$TARGET_GID" 2>/dev/null | cut -d: -f1 || true)"
+fi
+[[ -n "$TARGET_GROUP" ]] || TARGET_GROUP="$TARGET_USER"
 [[ -n "$TARGET_HOME" ]] || TARGET_HOME="/root"
+if [[ "$TARGET_HOME" == *$'\n'* || "$TARGET_HOME" == *$'\r'* ]]; then
+    printf '%s\n' "Invalid control characters in target user's home directory path."
+    exit 1
+fi
 
 FISH_DIR="$TARGET_HOME/.config/fish"
 FISH_FUNC_DIR="$FISH_DIR/functions"
@@ -42,6 +87,7 @@ NU_DIR="$TARGET_HOME/.config/nushell"
 STATE_DIR="$TARGET_HOME/.local/share/multiboot"
 STATE_FILE="$STATE_DIR/installed-directives"
 
+BOLD=$'\033[1m'
 RED=$'\033[1;31m'
 GREEN=$'\033[1;32m'
 YELLOW=$'\033[1;33m'
@@ -108,8 +154,35 @@ resolve_binary() {
     return 1
 }
 
+run_as_target_user() {
+    if (( EUID != 0 )) || [[ "$TARGET_UID" == "0" ]]; then
+        "$@"
+        return $?
+    fi
+    local runuser_bin su_bin bash_bin cmd_str="" arg
+    runuser_bin="$(resolve_binary runuser 2>/dev/null || true)"
+    if [[ -n "$runuser_bin" ]]; then
+        "$runuser_bin" -u "$TARGET_USER" -- "$@"
+        return $?
+    fi
+    su_bin="$(resolve_binary su 2>/dev/null || true)"
+    bash_bin="$(resolve_binary bash 2>/dev/null || printf '/bin/bash')"
+    if [[ -n "$su_bin" ]]; then
+        for arg in "$@"; do
+            cmd_str+="$(printf '%q ' "$arg")"
+        done
+        "$su_bin" -s "$bash_bin" "$TARGET_USER" -c "$cmd_str"
+        return $?
+    fi
+    return 1
+}
+
+target_uses_bash() {
+    [[ "${TARGET_SHELL##*/}" == "bash" || -f "$TARGET_HOME/.bashrc" || -f "$TARGET_HOME/.bash_profile" || -f "$TARGET_HOME/.bash_login" || -d "$BASH_COMP_DIR" ]]
+}
+
 is_installed() {
-    local visudo_check helper_shebang
+    local visudo_check helper_shebang sudoers_meta
     [[ -x "$BIN_PATH" && -s "$BIN_PATH" ]] || return 1
     [[ "$(head -n 1 "$BIN_PATH" 2>/dev/null)" == '#!/usr/bin/env bash' ]] || return 1
     grep -Fq 'sudo -v' "$BIN_PATH" 2>/dev/null || return 1
@@ -118,17 +191,25 @@ is_installed() {
     helper_shebang="$(head -n 1 "$HELPER_PATH" 2>/dev/null || true)"
     [[ "$helper_shebang" =~ ^#!/.*bash$ && "$helper_shebang" != *"/env "* ]] || return 1
     bash -n "$HELPER_PATH" >/dev/null 2>&1 || return 1
-    grep -Fq 'MTOOLS_SKIP_CHECK' "$HELPER_PATH" 2>/dev/null || return 1
     grep -Fq 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b' "$HELPER_PATH" 2>/dev/null || return 1
+    grep -Fq 'set-oneshot' "$HELPER_PATH" 2>/dev/null || return 1
     [[ -f "$SUDOERS_PATH" && -s "$SUDOERS_PATH" ]] || return 1
     visudo_check="$(resolve_binary visudo 2>/dev/null || true)"
     if (( EUID == 0 )) || [[ -r "$SUDOERS_PATH" ]]; then
         grep -Fq "$HELPER_PATH" "$SUDOERS_PATH" 2>/dev/null || return 1
-        if grep -Fq 'NOPASSWD' "$SUDOERS_PATH" 2>/dev/null; then
+        if grep -Eq 'NOPASSWD|timestamp_timeout|set-oneshot \*' "$SUDOERS_PATH" 2>/dev/null; then
             return 1
         fi
         if [[ -n "$visudo_check" ]]; then
             "$visudo_check" -cf "$SUDOERS_PATH" >/dev/null 2>&1 || return 1
+        fi
+    else
+        sudoers_meta="$(stat -c '%u:%g:%a' "$SUDOERS_PATH" 2>/dev/null || true)"
+        [[ "$sudoers_meta" == "0:0:440" || "$sudoers_meta" == "0:0:400" ]] || return 1
+        if command -v sudo >/dev/null 2>&1 && [[ -n "$visudo_check" ]]; then
+            if sudo -n true >/dev/null 2>&1; then
+                sudo -n "$visudo_check" -cf "$SUDOERS_PATH" >/dev/null 2>&1 || return 1
+            fi
         fi
     fi
     if command -v fish >/dev/null 2>&1 || [[ -d "$FISH_DIR" ]]; then
@@ -137,7 +218,7 @@ is_installed() {
     if command -v zsh >/dev/null 2>&1 || [[ -f "$TARGET_HOME/.zshrc" || -d "$TARGET_HOME/.zsh" ]]; then
         [[ -f "$ZSH_COMP_DIR/_boot" ]] || return 1
     fi
-    if command -v bash >/dev/null 2>&1 || [[ -f "$TARGET_HOME/.bashrc" ]]; then
+    if target_uses_bash; then
         [[ -f "$BASH_COMP_DIR/boot" ]] || return 1
     fi
     if command -v nu >/dev/null 2>&1 || [[ -d "$NU_DIR" ]]; then
@@ -170,8 +251,69 @@ confirm_twice() {
     [[ "${answer,,}" == y || "${answer,,}" == yes ]]
 }
 
+detect_package_manager() {
+    local os_id="" os_like=""
+    if [[ -r /etc/os-release ]]; then
+        os_id="$(awk -F= '/^ID=/ {gsub(/["'\'']/, "", $2); print tolower($2); exit}' /etc/os-release 2>/dev/null || true)"
+        os_like="$(awk -F= '/^ID_LIKE=/ {gsub(/["'\'']/, "", $2); print tolower($2); exit}' /etc/os-release 2>/dev/null || true)"
+    fi
+    case " $os_id $os_like " in
+        *" debian "*|*" ubuntu "*|*" linuxmint "*|*" pop "*|*" kali "*|*" elementary "*|*" zorin "*)
+            if command -v apt-get >/dev/null 2>&1; then printf 'apt-get'; return 0; fi ;;
+        *" arch "*|*" manjaro "*|*" endeavouros "*|*" cachyos "*|*" garuda "*|*" artix "*)
+            if command -v pacman >/dev/null 2>&1; then printf 'pacman'; return 0; fi ;;
+        *" fedora "*|*" rhel "*|*" centos "*|*" rocky "*|*" almalinux "*|*" ol "*)
+            if command -v dnf >/dev/null 2>&1; then printf 'dnf'; return 0; fi
+            if command -v yum >/dev/null 2>&1; then printf 'yum'; return 0; fi ;;
+        *" suse "*|*" opensuse "*|*" sles "*)
+            if command -v zypper >/dev/null 2>&1; then printf 'zypper'; return 0; fi ;;
+        *" alpine "*)
+            if command -v apk >/dev/null 2>&1; then printf 'apk'; return 0; fi ;;
+        *" void "*)
+            if command -v xbps-install >/dev/null 2>&1; then printf 'xbps-install'; return 0; fi ;;
+        *" gentoo "*)
+            if command -v emerge >/dev/null 2>&1; then printf 'emerge'; return 0; fi ;;
+    esac
+    if [[ -f /var/lib/dpkg/status ]] && command -v apt-get >/dev/null 2>&1; then
+        printf 'apt-get'
+    elif [[ -d /var/lib/pacman ]] && command -v pacman >/dev/null 2>&1; then
+        printf 'pacman'
+    elif [[ -d /var/lib/rpm ]] && command -v dnf >/dev/null 2>&1; then
+        printf 'dnf'
+    elif [[ -d /var/lib/rpm ]] && command -v zypper >/dev/null 2>&1; then
+        printf 'zypper'
+    elif [[ -d /etc/apk ]] && command -v apk >/dev/null 2>&1; then
+        printf 'apk'
+    elif [[ -d /var/db/xbps ]] && command -v xbps-install >/dev/null 2>&1; then
+        printf 'xbps-install'
+    elif [[ -d /var/lib/rpm ]] && command -v yum >/dev/null 2>&1; then
+        printf 'yum'
+    elif [[ -d /var/db/pkg ]] && command -v emerge >/dev/null 2>&1; then
+        printf 'emerge'
+    elif command -v apt-get >/dev/null 2>&1; then
+        printf 'apt-get'
+    elif command -v dnf >/dev/null 2>&1; then
+        printf 'dnf'
+    elif command -v pacman >/dev/null 2>&1; then
+        printf 'pacman'
+    elif command -v zypper >/dev/null 2>&1; then
+        printf 'zypper'
+    elif command -v xbps-install >/dev/null 2>&1; then
+        printf 'xbps-install'
+    elif command -v apk >/dev/null 2>&1; then
+        printf 'apk'
+    elif command -v yum >/dev/null 2>&1; then
+        printf 'yum'
+    elif command -v emerge >/dev/null 2>&1; then
+        printf 'emerge'
+    else
+        return 1
+    fi
+}
+
 install_package() {
     local package="$1"
+    local pm=""
     if [[ "$package" == efibootmgr ]] && resolve_binary efibootmgr >/dev/null 2>&1; then
         say "${GREEN}[+] efibootmgr is already installed.${RESET}"
         return 0
@@ -180,36 +322,49 @@ install_package() {
         say "${GREEN}[+] mtools is already installed.${RESET}"
         return 0
     fi
-    say "${YELLOW}[!] Installing package: ${package}${RESET}"
-    if command -v pacman >/dev/null 2>&1; then
-        run_root pacman -S --needed --noconfirm "$package" || return 1
-    elif command -v apt-get >/dev/null 2>&1; then
-        if (( APT_UPDATED == 0 )); then
-            run_root apt-get update -qq || return 1
-            APT_UPDATED=1
-        fi
-        run_root apt-get install -y "$package" || return 1
-    elif command -v dnf >/dev/null 2>&1; then
-        run_root dnf install -y "$package" || return 1
-    elif command -v zypper >/dev/null 2>&1; then
-        run_root zypper --non-interactive install -y "$package" || return 1
-    elif command -v xbps-install >/dev/null 2>&1; then
-        run_root xbps-install -Sy "$package" || return 1
-    elif command -v apk >/dev/null 2>&1; then
-        run_root apk add "$package" || return 1
-    elif command -v yum >/dev/null 2>&1; then
-        run_root yum install -y "$package" || return 1
-    elif command -v emerge >/dev/null 2>&1; then
-        run_root emerge --noreplace "$package" || return 1
-    else
+    pm="$(detect_package_manager 2>/dev/null || true)"
+    if [[ -z "$pm" ]]; then
         say "${RED}[!] No supported package manager was found. Install '${package}' manually.${RESET}"
         return 1
     fi
+    say "${YELLOW}[!] Installing package: ${package} (via ${pm})${RESET}"
+    case "$pm" in
+        apt-get)
+            if ! run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$package" >/dev/null 2>&1; then
+                if (( APT_UPDATED == 0 )); then
+                    run_root apt-get update -qq >/dev/null 2>&1 || true
+                    APT_UPDATED=1
+                fi
+                run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$package" || return 1
+            fi
+            ;;
+        pacman)
+            run_root pacman -S --needed --noconfirm "$package" || return 1
+            ;;
+        dnf)
+            run_root dnf install -y "$package" || return 1
+            ;;
+        zypper)
+            run_root zypper --non-interactive install -y "$package" || return 1
+            ;;
+        xbps-install)
+            run_root xbps-install -Sy "$package" || return 1
+            ;;
+        apk)
+            run_root apk add "$package" || return 1
+            ;;
+        yum)
+            run_root yum install -y "$package" || return 1
+            ;;
+        emerge)
+            run_root emerge --noreplace "$package" || return 1
+            ;;
+    esac
     INSTALLED_PACKAGES+=("$package")
 }
 
 validate_source() {
-    if [[ ! -f "$SRC_SCRIPT" ]]; then
+    if [[ ! -f "$SRC_SCRIPT" || ! -s "$SRC_SCRIPT" ]]; then
         say "${RED}[!] The boot script was not found beside install.sh.${RESET}"
         return 1
     fi
@@ -221,8 +376,8 @@ validate_source() {
         say "${RED}[!] The boot script contains a syntax error.${RESET}"
         return 1
     fi
-    if grep -nE '^[[:space:]]*#' "$SRC_SCRIPT" | grep -v '^1:#!/usr/bin/env bash$' >/dev/null 2>&1; then
-        say "${RED}[!] The boot script contains a prohibited comment line.${RESET}"
+    if ! grep -Fq -- '--complete' "$SRC_SCRIPT" 2>/dev/null; then
+        say "${RED}[!] The boot script does not support the required completion interface.${RESET}"
         return 1
     fi
 }
@@ -251,7 +406,7 @@ resolve_partuuid_device() {
 }
 
 detect_current_efistub() {
-    local output current_id line current_line="" active="0" loader="" opts="" partuuid="" base="" pattern hd_pattern raw_tail first_token trimmed_loader device fstype normalized_loader loader_info_file loader_info
+    local output current_id line current_line="" found_entry="0" loader="" opts="" partuuid="" base="" pattern hd_pattern raw_tail first_token trimmed_loader device fstype normalized_loader loader_info_file loader_info
     local scan_str chunk byte_hex byte_val ch hex_clean decoded_opts ascii_decoded utf16_pairs ascii_pairs idx
     EFISTUB_STATUS="Not verified"
     EFISTUB_REASON=""
@@ -288,18 +443,18 @@ detect_current_efistub() {
         return 1
     fi
     while IFS= read -r line; do
-        if [[ "$line" =~ ^Boot${current_id}(\*)?[[:space:]]*(.*)$ ]]; then
+        if [[ "$line" =~ ^[Bb][Oo][Oo][Tt]${current_id}(\*)?[[:space:]]*(.*)$ ]]; then
             current_line="$line"
-            [[ -n "${BASH_REMATCH[1]:-}" ]] && active="1"
+            found_entry="1"
             break
         fi
     done <<< "$output"
-    if [[ -z "$current_line" || "$active" != "1" ]]; then
-        EFISTUB_REASON="The current firmware entry Boot${current_id} could not be verified as active."
+    if [[ -z "$current_line" || "$found_entry" != "1" ]]; then
+        EFISTUB_REASON="The current firmware entry Boot${current_id} could not be found in NVRAM."
         return 1
     fi
-    pattern='File\(([^)]*)\)(.*)$'
-    hd_pattern='HD\([^)]*\)/([\\/].*)$'
+    pattern='[Ff][Ii][Ll][Ee]\(([^)]*)\)(.*)$'
+    hd_pattern='[Hh][Dd]\([^)]*\)/?([\\/].*)$'
     if [[ "$current_line" =~ $pattern ]]; then
         loader="${BASH_REMATCH[1]}"
         opts="${BASH_REMATCH[2]:-}"
@@ -477,7 +632,8 @@ read_u32_le() {
     if (( ${#bytes[@]} != 4 )); then
         return 1
     fi
-    printf '%d' $(( bytes[0] + (bytes[1] << 8) + (bytes[2] << 16) + (bytes[3] << 24) ))
+    awk -v b0="${bytes[0]}" -v b1="${bytes[1]}" -v b2="${bytes[2]}" -v b3="${bytes[3]}" \
+        'BEGIN { printf "%.0f", b0 + (b1 * 256) + (b2 * 65536) + (b3 * 16777216) }'
 }
 
 inspect_pe_sections() {
@@ -567,7 +723,7 @@ verify_current_efistub_file() {
     done
     if (( loaded_from_mount == 0 )); then
         if (( EUID == 0 )); then
-            if ! MTOOLS_SKIP_CHECK=1 "$MCOPY_BIN" -n -i "$real_device" "::/$relative" - > "$temporary" 2>/dev/null; then
+            if ! "$MCOPY_BIN" -n -i "$real_device" "::/$relative" - > "$temporary" 2>/dev/null; then
                 rm -f "$temporary"
                 EFISTUB_REASON="The current EFI-stub image '${EFISTUB_LOADER}' could not be read from PARTUUID=${EFISTUB_PARTUUID}."
                 return 1
@@ -575,13 +731,13 @@ verify_current_efistub_file() {
         elif [[ -x "$HELPER_PATH" ]] && sudo -n "$HELPER_PATH" read "$EFISTUB_PARTUUID" "$relative" > "$temporary" 2>/dev/null; then
             :
         elif (( ALLOW_ROOT_VERIFY == 1 )); then
-            if ! run_root env MTOOLS_SKIP_CHECK=1 "$MCOPY_BIN" -n -i "$real_device" "::/$relative" - > "$temporary" 2>/dev/null; then
+            if ! run_root "$MCOPY_BIN" -n -i "$real_device" "::/$relative" - > "$temporary" 2>/dev/null; then
                 rm -f "$temporary"
                 EFISTUB_REASON="The current EFI-stub image '${EFISTUB_LOADER}' could not be read from PARTUUID=${EFISTUB_PARTUUID}."
                 return 1
             fi
         else
-            if ! sudo -n env MTOOLS_SKIP_CHECK=1 "$MCOPY_BIN" -n -i "$real_device" "::/$relative" - > "$temporary" 2>/dev/null; then
+            if ! sudo -n "$MCOPY_BIN" -n -i "$real_device" "::/$relative" - > "$temporary" 2>/dev/null; then
                 rm -f "$temporary"
                 EFISTUB_REASON="The current EFI-stub image '${EFISTUB_LOADER}' could not be read from PARTUUID=${EFISTUB_PARTUUID} without a password prompt."
                 return 1
@@ -796,7 +952,7 @@ prepare_dependencies() {
 }
 
 create_efi_reader_helper() {
-    local temporary bash_bin lsblk_bin blkid_bin findmnt_bin efibootmgr_bin
+    local temporary bash_bin lsblk_bin blkid_bin findmnt_bin efibootmgr_bin bootctl_bin
     bash_bin="$(resolve_binary bash 2>/dev/null || true)"
     if [[ -z "$bash_bin" ]]; then
         say "${RED}[!] No trusted root-owned bash interpreter was found.${RESET}"
@@ -806,6 +962,7 @@ create_efi_reader_helper() {
     blkid_bin="$(resolve_binary blkid 2>/dev/null || true)"
     findmnt_bin="$(resolve_binary findmnt 2>/dev/null || true)"
     efibootmgr_bin="$(resolve_binary efibootmgr 2>/dev/null || true)"
+    bootctl_bin="$(resolve_binary bootctl 2>/dev/null || true)"
     if [[ -z "$lsblk_bin" && -z "$blkid_bin" ]]; then
         say "${RED}[!] Neither lsblk nor blkid is available in trusted system paths.${RESET}"
         return 1
@@ -817,17 +974,30 @@ set -Eeuo pipefail
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 IFS=\$' \\t\\n'
 unalias -a 2>/dev/null || true
-export PATH MTOOLS_SKIP_CHECK=1
+export PATH
 MCOPY_BIN=$(printf '%q' "$MCOPY_BIN")
 MDIR_BIN=$(printf '%q' "$MDIR_BIN")
 LSBLK_BIN=$(printf '%q' "$lsblk_bin")
 BLKID_BIN=$(printf '%q' "$blkid_bin")
 FINDMNT_BIN=$(printf '%q' "$findmnt_bin")
 EFIBOOTMGR_BIN=$(printf '%q' "$efibootmgr_bin")
-if (( \$# != 3 )); then
+BOOTCTL_BIN=$(printf '%q' "$bootctl_bin")
+if (( \$# < 1 )); then
     exit 2
 fi
 operation="\$1"
+if [[ "\$operation" == "set-oneshot" ]]; then
+    if (( \$# != 2 )); then
+        exit 2
+    fi
+    entry_id="\$2"
+    [[ "\$entry_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\$ ]] || exit 2
+    [[ -n "\$BOOTCTL_BIN" && -x "\$BOOTCTL_BIN" ]] || exit 1
+    exec "\$BOOTCTL_BIN" set-oneshot "\$entry_id"
+fi
+if (( \$# != 3 )); then
+    exit 2
+fi
 partuuid="\${2,,}"
 relative="\${3//\\\\//}"
 while [[ "\$relative" == *"//"* ]]; do
@@ -848,6 +1018,15 @@ device="/dev/disk/by-partuuid/\$partuuid"
 [[ -b "\$device" ]] || exit 1
 real_device="\$(readlink -f "\$device" 2>/dev/null || true)"
 [[ -n "\$real_device" && -b "\$real_device" ]] || exit 1
+case "\$real_device" in
+    /dev/loop*|/dev/ram*|/dev/zram*|/dev/nbd*) exit 1 ;;
+esac
+if [[ -n "\$BLKID_BIN" && -x "\$BLKID_BIN" ]]; then
+    match_count="\$("\$BLKID_BIN" -t "PARTUUID=\$partuuid" -o device 2>/dev/null | sed '/^\$/d' | wc -l | tr -d '[:space:]')"
+    if [[ "\$match_count" =~ ^[0-9]+\$ ]] && (( match_count > 1 )); then
+        exit 1
+    fi
+fi
 parttype=""
 fstype=""
 if [[ -n "\$LSBLK_BIN" && -x "\$LSBLK_BIN" ]]; then
@@ -867,7 +1046,7 @@ case "\$fstype" in
 esac
 authorized_esp=0
 if [[ -n "\$EFIBOOTMGR_BIN" && -x "\$EFIBOOTMGR_BIN" ]]; then
-    if "\$EFIBOOTMGR_BIN" -v 2>/dev/null | grep -Fqi "\$partuuid"; then
+    if "\$EFIBOOTMGR_BIN" -v 2>/dev/null | grep -Eiq "^Boot[0-9A-Fa-f]{4}\\*?[[:space:]].*HD\\([0-9]+,GPT,\${partuuid},"; then
         authorized_esp=1
     fi
 fi
@@ -925,7 +1104,7 @@ EOF_HELPER
 
 create_sudoers_rule() {
     local temporary prev_sudoers="" had_prev_sudoers=0 visudo_output su_bad_lines other_bad_lines candidate real_candidate seen_paths="|" commands=""
-    local -a efi_bins=() systemctl_bins=() reboot_bins=() bootctl_bins=()
+    local -a efi_bins=() systemctl_bins=() reboot_bins=()
     temporary="$(mktemp)"
     local boot_id_pattern="[0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF]"
     for candidate in "$EFI_BIN" /usr/bin/efibootmgr /usr/sbin/efibootmgr /bin/efibootmgr /sbin/efibootmgr; do
@@ -948,7 +1127,7 @@ create_sudoers_rule() {
     for candidate in "${efi_bins[@]}"; do
         commands+="${candidate} -v, ${candidate} -n ${boot_id_pattern}, ${candidate} --bootnext ${boot_id_pattern}, ${candidate} -N, ${candidate} --delete-bootnext, "
     done
-    commands+="${HELPER_PATH} exists *, ${HELPER_PATH} read *"
+    commands+="${HELPER_PATH} exists *, ${HELPER_PATH} read *, ${HELPER_PATH} set-oneshot [A-Za-z0-9]*"
     seen_paths="|"
     if [[ -n "$SYSTEMCTL_BIN" ]]; then
         for candidate in "$SYSTEMCTL_BIN" /usr/bin/systemctl /bin/systemctl /usr/sbin/systemctl /sbin/systemctl; do
@@ -993,25 +1172,7 @@ create_sudoers_rule() {
         say "${RED}[!] No supported reboot command was found.${RESET}"
         return 1
     fi
-    seen_paths="|"
-    if [[ -n "$BOOTCTL_BIN" ]]; then
-        for candidate in "$BOOTCTL_BIN" /usr/bin/bootctl /bin/bootctl /usr/sbin/bootctl /sbin/bootctl; do
-            [[ -n "$candidate" ]] && is_trusted_root_binary "$candidate" || continue
-            if [[ "$seen_paths" != *"|${candidate}|"* ]]; then
-                seen_paths+="${candidate}|"
-                bootctl_bins+=("$candidate")
-            fi
-            real_candidate="$(readlink -f "$candidate" 2>/dev/null || true)"
-            if [[ -n "$real_candidate" ]] && is_trusted_root_binary "$real_candidate" && [[ "$seen_paths" != *"|${real_candidate}|"* ]]; then
-                seen_paths+="${real_candidate}|"
-                bootctl_bins+=("$real_candidate")
-            fi
-        done
-        for candidate in "${bootctl_bins[@]}"; do
-            commands+=", ${candidate} set-oneshot *"
-        done
-    fi
-    printf 'Defaults:%s timestamp_timeout=5\n%s ALL=(root) %s\n' "$TARGET_USER" "$TARGET_USER" "$commands" > "$temporary"
+    printf '%s ALL=(root) %s\n' "$TARGET_USER" "$commands" > "$temporary"
     if ! visudo_output="$(run_root "$VISUDO_BIN" -cf "$temporary" 2>&1)"; then
         rm -f "$temporary"
         say "${RED}[!] The sudoers rule failed visudo validation: ${visudo_output}${RESET}"
@@ -1077,13 +1238,41 @@ install_boot_binary() {
     {
         printf '#!/usr/bin/env bash\n'
         cat <<'EOF_AUTH'
-if [[ "${1:-}" != "--complete" && "${EUID:-$(id -u)}" -ne 0 ]]; then
+if [[ "${1:-}" != "--complete" && "${MULTIBOOT_NO_AUTH:-0}" != "1" && "${EUID:-$(id -u)}" -ne 0 ]]; then
     if command -v sudo >/dev/null 2>&1; then
-        sudo -k 2>/dev/null || true
-        sudo -v || exit 1
-        trap 'sudo -k 2>/dev/null || true' EXIT INT TERM
+        command sudo -k 2>/dev/null || true
+        command sudo -v || exit 1
+        trap 'command sudo -k 2>/dev/null || true' EXIT INT TERM HUP
     fi
 fi
+sudo() {
+    local -a sudo_opts=() cmd_args=()
+    while (( $# > 0 )); do
+        case "$1" in
+            -n|--non-interactive)
+                sudo_opts+=("$1")
+                shift
+                ;;
+            --)
+                shift
+                cmd_args+=("$@")
+                break
+                ;;
+            *)
+                cmd_args+=("$@")
+                break
+                ;;
+        esac
+    done
+    if (( ${#cmd_args[@]} == 3 )) && [[ "${cmd_args[0]}" == "bootctl" || "${cmd_args[0]}" == */bootctl ]] && [[ "${cmd_args[1]}" == "set-oneshot" ]]; then
+        if [[ "${cmd_args[2]}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+            command sudo "${sudo_opts[@]}" /usr/local/libexec/multiboot-efi-read set-oneshot "${cmd_args[2]}"
+            return $?
+        fi
+        return 2
+    fi
+    command sudo "${sudo_opts[@]}" "${cmd_args[@]}"
+}
 EOF_AUTH
         tail -n +2 "$SRC_SCRIPT"
     } > "$temporary" || {
@@ -1108,7 +1297,7 @@ validate_safe_user_path() {
     local rel current owner
     local -a components=()
     [[ -n "$TARGET_HOME" && "$TARGET_HOME" == /* && -d "$TARGET_HOME" && ! -L "$TARGET_HOME" ]] || return 1
-    if (( EUID == 0 )) && [[ "$TARGET_USER" != "root" ]]; then
+    if [[ "$TARGET_USER" != "root" ]]; then
         owner="$(stat -c '%u' "$TARGET_HOME" 2>/dev/null || printf '0')"
         [[ "$owner" == "$TARGET_UID" ]] || return 1
     fi
@@ -1137,7 +1326,7 @@ validate_safe_user_path() {
                     any) [[ -d "$current" || -f "$current" ]] || return 1 ;;
                 esac
             fi
-            if (( EUID == 0 )) && [[ "$TARGET_USER" != "root" ]]; then
+            if [[ "$TARGET_USER" != "root" ]]; then
                 owner="$(stat -c '%u' "$current" 2>/dev/null || printf '0')"
                 [[ "$owner" == "$TARGET_UID" ]] || return 1
             fi
@@ -1161,17 +1350,17 @@ ensure_safe_user_dir() {
             return 1
         fi
         if [[ ! -e "$current" ]]; then
-            mkdir "$current" || return 1
+            run_as_target_user mkdir "$current" || return 1
             if [[ -L "$current" ]]; then
                 say "${RED}[!] Symbolic link detected after creating ${current}.${RESET}"
                 return 1
             fi
             if (( EUID == 0 )); then
-                chown -h "$TARGET_UID:$TARGET_GID" "$current" || return 1
+                chown -h "$TARGET_UID:$TARGET_GID" "$current" 2>/dev/null || true
             fi
         else
             [[ -d "$current" && ! -L "$current" ]] || return 1
-            if (( EUID == 0 )) && [[ "$TARGET_USER" != "root" ]]; then
+            if [[ "$TARGET_USER" != "root" ]]; then
                 owner="$(stat -c '%u' "$current" 2>/dev/null || printf '0')"
                 [[ "$owner" == "$TARGET_UID" ]] || return 1
             fi
@@ -1193,36 +1382,27 @@ write_user_file() {
             ensure_safe_user_dir "$STATE_DIR" || return 1
             validate_safe_user_path "$STATE_DIR/backup-$marker" "file" || return 1
             if [[ ! -e "$STATE_DIR/backup-$marker" ]]; then
-                cp -P -- "$destination" "$STATE_DIR/backup-$marker" || return 1
-                if (( EUID == 0 )); then
-                    chown -h "$TARGET_UID:$TARGET_GID" "$STATE_DIR/backup-$marker" || return 1
-                fi
+                run_as_target_user cp -P -- "$destination" "$STATE_DIR/backup-$marker" || return 1
             fi
         fi
     fi
     ensure_safe_user_dir "$dest_dir" || return 1
     validate_safe_user_path "$destination" "file" || return 1
-    temporary="$(mktemp "$dest_dir/.multiboot.XXXXXX")" || return 1
-    if ! printf '%s\n' "$source" > "$temporary"; then
-        rm -f "$temporary"
+    temporary="$(run_as_target_user mktemp "$dest_dir/.multiboot.XXXXXX")" || return 1
+    if ! printf '%s\n' "$source" | run_as_target_user tee "$temporary" >/dev/null; then
+        run_as_target_user rm -f "$temporary" >/dev/null 2>&1 || true
         return 1
     fi
-    chmod "$mode" "$temporary" || {
-        rm -f "$temporary"
+    if ! run_as_target_user chmod "$mode" "$temporary"; then
+        run_as_target_user rm -f "$temporary" >/dev/null 2>&1 || true
         return 1
-    }
-    if (( EUID == 0 )); then
-        chown -h "$TARGET_UID:$TARGET_GID" "$temporary" || {
-            rm -f "$temporary"
-            return 1
-        }
     fi
-    validate_safe_user_path "$destination" "file" || {
-        rm -f "$temporary"
+    if ! validate_safe_user_path "$destination" "file"; then
+        run_as_target_user rm -f "$temporary" >/dev/null 2>&1 || true
         return 1
-    }
-    if ! mv -Tf "$temporary" "$destination"; then
-        rm -f "$temporary"
+    fi
+    if ! run_as_target_user mv -Tf "$temporary" "$destination"; then
+        run_as_target_user rm -f "$temporary" >/dev/null 2>&1 || true
         return 1
     fi
     if [[ -n "$marker" ]]; then
@@ -1245,33 +1425,27 @@ append_unique_line() {
             return 0
         fi
     fi
-    temporary="$(mktemp "$dest_dir/.multiboot.XXXXXX")" || return 1
+    temporary="$(run_as_target_user mktemp "$dest_dir/.multiboot.XXXXXX")" || return 1
     if [[ -f "$file" ]]; then
-        cat "$file" > "$temporary" || {
-            rm -f "$temporary"
+        if ! run_as_target_user cp -- "$file" "$temporary"; then
+            run_as_target_user rm -f "$temporary" >/dev/null 2>&1 || true
             return 1
-        }
+        fi
     fi
-    printf '%s\n' "$line" >> "$temporary" || {
-        rm -f "$temporary"
+    if ! printf '%s\n' "$line" | run_as_target_user tee -a "$temporary" >/dev/null; then
+        run_as_target_user rm -f "$temporary" >/dev/null 2>&1 || true
         return 1
-    }
-    chmod "$file_mode" "$temporary" || {
-        rm -f "$temporary"
-        return 1
-    }
-    if (( EUID == 0 )); then
-        chown -h "$TARGET_UID:$TARGET_GID" "$temporary" || {
-            rm -f "$temporary"
-            return 1
-        }
     fi
-    validate_safe_user_path "$file" "file" || {
-        rm -f "$temporary"
+    if ! run_as_target_user chmod "$file_mode" "$temporary"; then
+        run_as_target_user rm -f "$temporary" >/dev/null 2>&1 || true
         return 1
-    }
-    if ! mv -Tf "$temporary" "$file"; then
-        rm -f "$temporary"
+    fi
+    if ! validate_safe_user_path "$file" "file"; then
+        run_as_target_user rm -f "$temporary" >/dev/null 2>&1 || true
+        return 1
+    fi
+    if ! run_as_target_user mv -Tf "$temporary" "$file"; then
+        run_as_target_user rm -f "$temporary" >/dev/null 2>&1 || true
         return 1
     fi
     [[ -n "$marker" ]] && record_added_directive "$marker"
@@ -1288,33 +1462,27 @@ record_added_directive() {
             return 0
         fi
     fi
-    temporary="$(mktemp "$STATE_DIR/.multiboot.XXXXXX")" || return 1
+    temporary="$(run_as_target_user mktemp "$STATE_DIR/.multiboot.XXXXXX")" || return 1
     if [[ -f "$STATE_FILE" ]]; then
-        cat "$STATE_FILE" > "$temporary" || {
-            rm -f "$temporary"
+        if ! run_as_target_user cp -- "$STATE_FILE" "$temporary"; then
+            run_as_target_user rm -f "$temporary" >/dev/null 2>&1 || true
             return 1
-        }
+        fi
     fi
-    printf '%s\n' "$marker" >> "$temporary" || {
-        rm -f "$temporary"
+    if ! printf '%s\n' "$marker" | run_as_target_user tee -a "$temporary" >/dev/null; then
+        run_as_target_user rm -f "$temporary" >/dev/null 2>&1 || true
         return 1
-    }
-    chmod "$file_mode" "$temporary" || {
-        rm -f "$temporary"
-        return 1
-    }
-    if (( EUID == 0 )); then
-        chown -h "$TARGET_UID:$TARGET_GID" "$temporary" || {
-            rm -f "$temporary"
-            return 1
-        }
     fi
-    validate_safe_user_path "$STATE_FILE" "file" || {
-        rm -f "$temporary"
+    if ! run_as_target_user chmod "$file_mode" "$temporary"; then
+        run_as_target_user rm -f "$temporary" >/dev/null 2>&1 || true
         return 1
-    }
-    if ! mv -Tf "$temporary" "$STATE_FILE"; then
-        rm -f "$temporary"
+    fi
+    if ! validate_safe_user_path "$STATE_FILE" "file"; then
+        run_as_target_user rm -f "$temporary" >/dev/null 2>&1 || true
+        return 1
+    fi
+    if ! run_as_target_user mv -Tf "$temporary" "$STATE_FILE"; then
+        run_as_target_user rm -f "$temporary" >/dev/null 2>&1 || true
         return 1
     fi
 }
@@ -1334,33 +1502,27 @@ prepend_unique_line() {
             return 0
         fi
     fi
-    temporary="$(mktemp "$dest_dir/.multiboot.XXXXXX")" || return 1
-    printf '%s\n' "$line" > "$temporary" || {
-        rm -f "$temporary"
+    temporary="$(run_as_target_user mktemp "$dest_dir/.multiboot.XXXXXX")" || return 1
+    if ! printf '%s\n' "$line" | run_as_target_user tee "$temporary" >/dev/null; then
+        run_as_target_user rm -f "$temporary" >/dev/null 2>&1 || true
         return 1
-    }
+    fi
     if [[ -f "$file" ]]; then
-        cat "$file" >> "$temporary" || {
-            rm -f "$temporary"
+        if ! run_as_target_user tee -a "$temporary" < "$file" >/dev/null; then
+            run_as_target_user rm -f "$temporary" >/dev/null 2>&1 || true
             return 1
-        }
+        fi
     fi
-    chmod "$file_mode" "$temporary" || {
-        rm -f "$temporary"
+    if ! run_as_target_user chmod "$file_mode" "$temporary"; then
+        run_as_target_user rm -f "$temporary" >/dev/null 2>&1 || true
         return 1
-    }
-    if (( EUID == 0 )); then
-        chown -h "$TARGET_UID:$TARGET_GID" "$temporary" || {
-            rm -f "$temporary"
-            return 1
-        }
     fi
-    validate_safe_user_path "$file" "file" || {
-        rm -f "$temporary"
+    if ! validate_safe_user_path "$file" "file"; then
+        run_as_target_user rm -f "$temporary" >/dev/null 2>&1 || true
         return 1
-    }
-    if ! mv -Tf "$temporary" "$file"; then
-        rm -f "$temporary"
+    fi
+    if ! run_as_target_user mv -Tf "$temporary" "$file"; then
+        run_as_target_user rm -f "$temporary" >/dev/null 2>&1 || true
         return 1
     fi
     [[ -n "$marker" ]] && record_added_directive "$marker"
@@ -1375,33 +1537,27 @@ remove_exact_line() {
     [[ -f "$file" ]] || return 0
     dest_dir="$(dirname "$file")"
     file_mode="$(stat -c '%a' "$file" 2>/dev/null || printf '644')"
-    temporary="$(mktemp "$dest_dir/.multiboot.XXXXXX")" || return 1
-    if ! awk -v target="$line" '$0 != target' "$file" > "$temporary"; then
-        rm -f "$temporary"
+    temporary="$(run_as_target_user mktemp "$dest_dir/.multiboot.XXXXXX")" || return 1
+    if ! awk -v target="$line" '$0 != target' "$file" | run_as_target_user tee "$temporary" >/dev/null; then
+        run_as_target_user rm -f "$temporary" >/dev/null 2>&1 || true
         return 1
     fi
-    chmod "$file_mode" "$temporary" || {
-        rm -f "$temporary"
+    if ! run_as_target_user chmod "$file_mode" "$temporary"; then
+        run_as_target_user rm -f "$temporary" >/dev/null 2>&1 || true
         return 1
-    }
-    if (( EUID == 0 )); then
-        chown -h "$TARGET_UID:$TARGET_GID" "$temporary" || {
-            rm -f "$temporary"
-            return 1
-        }
     fi
-    validate_safe_user_path "$file" "file" || {
-        rm -f "$temporary"
+    if ! validate_safe_user_path "$file" "file"; then
+        run_as_target_user rm -f "$temporary" >/dev/null 2>&1 || true
         return 1
-    }
-    if ! mv -Tf "$temporary" "$file"; then
-        rm -f "$temporary"
+    fi
+    if ! run_as_target_user mv -Tf "$temporary" "$file"; then
+        run_as_target_user rm -f "$temporary" >/dev/null 2>&1 || true
         return 1
     fi
 }
 
 configure_shells() {
-    local fish_function fish_completion zsh_completion bash_completion nu_completion profile_file bashrc zshrc nu_config fish_history fish_hist_tmp fish_hist_mode="644" timestamp target configured_list=""
+    local fish_function fish_completion zsh_completion bash_completion nu_completion profile_file bashrc zshrc nu_config fish_history fish_hist_tmp fish_hist_mode="644" timestamp target configured_list="" zsh_single_quoted_dir
     local -a targets=()
     mapfile -t targets < <("$BIN_PATH" --complete 2>/dev/null || true)
 
@@ -1423,40 +1579,34 @@ complete -c boot -a '($BIN_PATH --complete 2>/dev/null | string escape --no-quot
         if [[ -f "$fish_history" ]]; then
             fish_hist_mode="$(stat -c '%a' "$fish_history" 2>/dev/null || printf '644')"
         fi
-        fish_hist_tmp="$(mktemp "$FISH_DATA_DIR/.multiboot.XXXXXX")" || return 1
+        fish_hist_tmp="$(run_as_target_user mktemp "$FISH_DATA_DIR/.multiboot.XXXXXX")" || return 1
         if [[ -f "$fish_history" ]]; then
-            cat "$fish_history" > "$fish_hist_tmp" || {
-                rm -f "$fish_hist_tmp"
+            if ! run_as_target_user cp -- "$fish_history" "$fish_hist_tmp"; then
+                run_as_target_user rm -f "$fish_hist_tmp" >/dev/null 2>&1 || true
                 return 1
-            }
+            fi
         fi
         timestamp="$(date +%s)"
         for target in "${targets[@]:-}"; do
             [[ -n "$target" ]] || continue
             local history_command="boot '$target'"
             if ! grep -Fq -- "- cmd: $history_command" "$fish_hist_tmp"; then
-                printf -- "- cmd: %s\n  when: %s\n" "$history_command" "$timestamp" >> "$fish_hist_tmp" || {
-                    rm -f "$fish_hist_tmp"
+                if ! printf -- "- cmd: %s\n  when: %s\n" "$history_command" "$timestamp" | run_as_target_user tee -a "$fish_hist_tmp" >/dev/null; then
+                    run_as_target_user rm -f "$fish_hist_tmp" >/dev/null 2>&1 || true
                     return 1
-                }
+                fi
             fi
         done
-        chmod "$fish_hist_mode" "$fish_hist_tmp" || {
-            rm -f "$fish_hist_tmp"
+        if ! run_as_target_user chmod "$fish_hist_mode" "$fish_hist_tmp"; then
+            run_as_target_user rm -f "$fish_hist_tmp" >/dev/null 2>&1 || true
             return 1
-        }
-        if (( EUID == 0 )); then
-            chown -h "$TARGET_UID:$TARGET_GID" "$fish_hist_tmp" || {
-                rm -f "$fish_hist_tmp"
-                return 1
-            }
         fi
-        validate_safe_user_path "$fish_history" "file" || {
-            rm -f "$fish_hist_tmp"
+        if ! validate_safe_user_path "$fish_history" "file"; then
+            run_as_target_user rm -f "$fish_hist_tmp" >/dev/null 2>&1 || true
             return 1
-        }
-        if ! mv -Tf "$fish_hist_tmp" "$fish_history"; then
-            rm -f "$fish_hist_tmp"
+        fi
+        if ! run_as_target_user mv -Tf "$fish_hist_tmp" "$fish_history"; then
+            run_as_target_user rm -f "$fish_hist_tmp" >/dev/null 2>&1 || true
             return 1
         fi
         configured_list+="Fish, "
@@ -1473,42 +1623,90 @@ complete -c boot -a '($BIN_PATH --complete 2>/dev/null | string escape --no-quot
 compdef _boot boot"
         write_user_file "$zsh_completion" "$ZSH_COMP_DIR/_boot" 644 "zsh-comp" || return 1
         zshrc="$TARGET_HOME/.zshrc"
-        prepend_unique_line "$zshrc" "fpath=(\"$ZSH_COMP_DIR\" \$fpath)" zsh-fpath || return 1
+        zsh_single_quoted_dir="'${ZSH_COMP_DIR//\'/\'\\\'\'}'"
+        prepend_unique_line "$zshrc" "fpath=(${zsh_single_quoted_dir} \$fpath)" zsh-fpath || return 1
         append_unique_line "$zshrc" 'autoload -Uz compinit && compinit' zsh-compinit || return 1
         append_unique_line "$zshrc" 'compdef _boot boot' zsh-compdef || return 1
         configured_list+="Zsh, "
     fi
 
-    if command -v bash >/dev/null 2>&1 || [[ -f "$TARGET_HOME/.bashrc" ]]; then
+    if target_uses_bash; then
         bash_completion="_boot_complete() {
-    local current=\"\${COMP_WORDS[COMP_CWORD]}\" candidate word prefix=\"\"
-    local index
+    local current=\"\${COMP_WORDS[COMP_CWORD]}\" word unescaped prefix=\"\" quote_mode=\"none\"
+    local index i ch
     local -a options typed
     options=(-h --help -l --list -t --test -f --force)
     typed=()
     COMPREPLY=()
-    if (( COMP_CWORD == 1 )); then
-        for candidate in \"\${options[@]}\"; do
-            [[ \"\$candidate\" == \"\$current\"* ]] && COMPREPLY+=(\"\$candidate\")
-        done
-    fi
     for ((index=1; index<COMP_CWORD; index++)); do
         word=\"\${COMP_WORDS[index]}\"
         case \"\$word\" in
-            -f|--force|-t|--test) ;;
-            *) typed+=(\"\$word\") ;;
+            -h|--help|-l|--list)
+                return 0
+                ;;
+            -f|--force|-t|--test)
+                ;;
+            *)
+                typed+=(\"\$word\")
+                ;;
         esac
     done
+    if (( COMP_CWORD == 1 )) && [[ -z \"\$current\" || \"\$current\" == -* ]]; then
+        for word in \"\${options[@]}\"; do
+            [[ \"\$word\" == \"\$current\"* ]] && COMPREPLY+=(\"\$word\")
+        done
+        [[ \"\$current\" == -* ]] && return 0
+    fi
     if (( \${#typed[@]} > 0 )); then
         prefix=\"\${typed[*]} \"
     fi
     prefix+=\"\$current\"
+    if [[ \"\$prefix\" == \\\"* ]]; then
+        quote_mode=\"double\"
+        prefix=\"\${prefix:1}\"
+    elif [[ \"\$prefix\" == \\'* ]]; then
+        quote_mode=\"single\"
+        prefix=\"\${prefix:1}\"
+    fi
+    unescaped=\"\"
+    if [[ \"\$quote_mode\" == \"none\" ]]; then
+        for ((i=0; i<\${#prefix}; i++)); do
+            ch=\"\${prefix:i:1}\"
+            if [[ \"\$ch\" == \"\\\\\" && \$((i + 1)) -lt \${#prefix} ]]; then
+                i=\$((i + 1))
+                unescaped+=\"\${prefix:i:1}\"
+            else
+                unescaped+=\"\$ch\"
+            fi
+        done
+    else
+        unescaped=\"\$prefix\"
+    fi
+    local prior_unescaped=\"\"
+    if (( \${#typed[@]} > 0 )); then
+        local prior_raw=\"\${typed[*]} \"
+        for ((i=0; i<\${#prior_raw}; i++)); do
+            ch=\"\${prior_raw:i:1}\"
+            if [[ \"\$ch\" == \"\\\\\" && \$((i + 1)) -lt \${#prior_raw} ]]; then
+                i=\$((i + 1))
+                prior_unescaped+=\"\${prior_raw:i:1}\"
+            else
+                prior_unescaped+=\"\$ch\"
+            fi
+        done
+    fi
+    local candidate escaped_candidate
     while IFS= read -r candidate; do
-        [[ \"\$candidate\" == \"\$prefix\"* ]] || continue
-        if (( \${#typed[@]} > 0 )); then
-            candidate=\"\${candidate#\"\${typed[*]} \"}\"
+        [[ \"\$candidate\" == \"\$unescaped\"* ]] || continue
+        if [[ -n \"\$prior_unescaped\" ]]; then
+            candidate=\"\${candidate#\"\$prior_unescaped\"}\"
         fi
-        COMPREPLY+=(\"\$candidate\")
+        if [[ \"\$quote_mode\" == \"none\" ]]; then
+            printf -v escaped_candidate '%q' \"\$candidate\"
+            COMPREPLY+=(\"\$escaped_candidate\")
+        else
+            COMPREPLY+=(\"\$candidate\")
+        fi
     done < <(command $BIN_PATH --complete 2>/dev/null)
 }
 complete -F _boot_complete boot"
@@ -1545,9 +1743,35 @@ print_restart_notice() {
     say "${YELLOW}Please restart your Terminal or start a new login session.${RESET}"
 }
 
+rollback_system_files() {
+    local backup_dir="$1"
+    local exists_bin="$2" had_bin="$3"
+    local exists_helper="$4" had_helper="$5"
+    local exists_sudoers="$6" had_sudoers="$7"
+    if (( had_bin == 1 )); then
+        run_root install -d -m 755 -o root -g root "$BIN_DIR" >/dev/null 2>&1 || true
+        run_root install -m 755 -o root -g root "$backup_dir/bin" "$BIN_PATH" >/dev/null 2>&1 || true
+    elif (( exists_bin == 0 )); then
+        run_root rm -f "$BIN_PATH" >/dev/null 2>&1 || true
+    fi
+    if (( had_helper == 1 )); then
+        run_root install -d -m 755 -o root -g root "$LIBEXEC_DIR" >/dev/null 2>&1 || true
+        run_root install -m 755 -o root -g root "$backup_dir/helper" "$HELPER_PATH" >/dev/null 2>&1 || true
+    elif (( exists_helper == 0 )); then
+        run_root rm -f "$HELPER_PATH" >/dev/null 2>&1 || true
+    fi
+    if (( had_sudoers == 1 )); then
+        run_root install -d -m 755 -o root -g root "$SUDOERS_DIR" >/dev/null 2>&1 || true
+        run_root install -m 440 -o root -g root "$backup_dir/sudoers" "$SUDOERS_PATH" >/dev/null 2>&1 || true
+    elif (( exists_sudoers == 0 )); then
+        run_root rm -f "$SUDOERS_PATH" >/dev/null 2>&1 || true
+    fi
+}
+
 do_install() {
     local action="${1:-install}"
-    local first_confirmation second_confirmation backup_dir="" had_helper=0 had_sudoers=0 had_bin=0
+    local first_confirmation second_confirmation backup_dir=""
+    local exists_helper=0 had_helper=0 exists_sudoers=0 had_sudoers=0 exists_bin=0 had_bin=0
     if [[ "$action" == "repair" ]]; then
         say "${BLUE}[*] Preparing Multi Boot repair.${RESET}"
         first_confirmation="Repair Multi Boot for ${TARGET_USER}? (y/n)"
@@ -1570,95 +1794,106 @@ do_install() {
             return 1
         fi
         sudo -v || return 1
+        trap 'sudo -k 2>/dev/null || true; [[ -n "${backup_dir:-}" ]] && rm -rf "$backup_dir"' EXIT INT TERM HUP
+    else
+        trap '[[ -n "${backup_dir:-}" ]] && rm -rf "$backup_dir"' EXIT INT TERM HUP
     fi
     ALLOW_ROOT_VERIFY=1
     if ! prepare_dependencies; then
         ALLOW_ROOT_VERIFY=0
+        trap - EXIT INT TERM HUP
+        (( EUID != 0 )) && sudo -k 2>/dev/null || true
         return 1
     fi
     ALLOW_ROOT_VERIFY=0
     say "${GREEN}[+] EFISTUB requirement passed.${RESET}"
-    backup_dir="$(mktemp -d)" || return 1
-    if run_root test -f "$HELPER_PATH" 2>/dev/null && run_root cat "$HELPER_PATH" > "$backup_dir/helper" 2>/dev/null; then
+    backup_dir="$(mktemp -d)" || {
+        trap - EXIT INT TERM HUP
+        (( EUID != 0 )) && sudo -k 2>/dev/null || true
+        return 1
+    }
+    if run_root test -e "$HELPER_PATH" 2>/dev/null; then
+        exists_helper=1
+        if ! run_root cat "$HELPER_PATH" > "$backup_dir/helper" 2>/dev/null; then
+            rm -rf "$backup_dir"
+            trap - EXIT INT TERM HUP
+            (( EUID != 0 )) && sudo -k 2>/dev/null || true
+            say "${RED}[!] Failed to back up existing helper before modification. Installation stopped.${RESET}"
+            return 1
+        fi
         had_helper=1
     fi
-    if run_root test -f "$SUDOERS_PATH" 2>/dev/null && run_root cat "$SUDOERS_PATH" > "$backup_dir/sudoers" 2>/dev/null; then
+    if run_root test -e "$SUDOERS_PATH" 2>/dev/null; then
+        exists_sudoers=1
+        if ! run_root cat "$SUDOERS_PATH" > "$backup_dir/sudoers" 2>/dev/null; then
+            rm -rf "$backup_dir"
+            trap - EXIT INT TERM HUP
+            (( EUID != 0 )) && sudo -k 2>/dev/null || true
+            say "${RED}[!] Failed to back up existing sudoers rule before modification. Installation stopped.${RESET}"
+            return 1
+        fi
         had_sudoers=1
     fi
-    if run_root test -f "$BIN_PATH" 2>/dev/null && run_root cat "$BIN_PATH" > "$backup_dir/bin" 2>/dev/null; then
+    if run_root test -e "$BIN_PATH" 2>/dev/null; then
+        exists_bin=1
+        if ! run_root cat "$BIN_PATH" > "$backup_dir/bin" 2>/dev/null; then
+            rm -rf "$backup_dir"
+            trap - EXIT INT TERM HUP
+            (( EUID != 0 )) && sudo -k 2>/dev/null || true
+            say "${RED}[!] Failed to back up existing boot command before modification. Installation stopped.${RESET}"
+            return 1
+        fi
         had_bin=1
     fi
     if ! create_efi_reader_helper; then
-        if (( had_helper == 1 )); then
-            run_root install -d -m 755 -o root -g root "$LIBEXEC_DIR" >/dev/null 2>&1 || true
-            run_root install -m 755 -o root -g root "$backup_dir/helper" "$HELPER_PATH" >/dev/null 2>&1 || true
-        else
-            run_root rm -f "$HELPER_PATH"
-        fi
+        rollback_system_files "$backup_dir" "$exists_bin" "$had_bin" "$exists_helper" "$had_helper" "$exists_sudoers" "$had_sudoers"
         rm -rf "$backup_dir"
+        trap - EXIT INT TERM HUP
+        (( EUID != 0 )) && sudo -k 2>/dev/null || true
         say "${RED}[!] Failed to install the restricted EFI reader helper.${RESET}"
         return 1
     fi
     if ! create_sudoers_rule; then
-        if (( had_helper == 1 )); then
-            run_root install -m 755 -o root -g root "$backup_dir/helper" "$HELPER_PATH" >/dev/null 2>&1 || true
-        else
-            run_root rm -f "$HELPER_PATH"
-        fi
-        if (( had_sudoers == 1 )); then
-            run_root install -m 440 -o root -g root "$backup_dir/sudoers" "$SUDOERS_PATH" >/dev/null 2>&1 || true
-        else
-            run_root rm -f "$SUDOERS_PATH"
-        fi
+        rollback_system_files "$backup_dir" "$exists_bin" "$had_bin" "$exists_helper" "$had_helper" "$exists_sudoers" "$had_sudoers"
         rm -rf "$backup_dir"
+        trap - EXIT INT TERM HUP
+        (( EUID != 0 )) && sudo -k 2>/dev/null || true
         return 1
     fi
     if ! run_root install -d -m 755 -o root -g root "$BIN_DIR"; then
-        if (( had_helper == 1 )); then
-            run_root install -m 755 -o root -g root "$backup_dir/helper" "$HELPER_PATH" >/dev/null 2>&1 || true
-        else
-            run_root rm -f "$HELPER_PATH"
-        fi
-        if (( had_sudoers == 1 )); then
-            run_root install -m 440 -o root -g root "$backup_dir/sudoers" "$SUDOERS_PATH" >/dev/null 2>&1 || true
-        else
-            run_root rm -f "$SUDOERS_PATH"
-        fi
+        rollback_system_files "$backup_dir" "$exists_bin" "$had_bin" "$exists_helper" "$had_helper" "$exists_sudoers" "$had_sudoers"
         rm -rf "$backup_dir"
+        trap - EXIT INT TERM HUP
+        (( EUID != 0 )) && sudo -k 2>/dev/null || true
         say "${RED}[!] Failed to create the system binary directory.${RESET}"
         return 1
     fi
     if ! install_boot_binary; then
-        if (( had_bin == 1 )); then
-            run_root install -m 755 -o root -g root "$backup_dir/bin" "$BIN_PATH" >/dev/null 2>&1 || true
-        else
-            run_root rm -f "$BIN_PATH"
-        fi
-        if (( had_helper == 1 )); then
-            run_root install -m 755 -o root -g root "$backup_dir/helper" "$HELPER_PATH" >/dev/null 2>&1 || true
-        else
-            run_root rm -f "$HELPER_PATH"
-        fi
-        if (( had_sudoers == 1 )); then
-            run_root install -m 440 -o root -g root "$backup_dir/sudoers" "$SUDOERS_PATH" >/dev/null 2>&1 || true
-        else
-            run_root rm -f "$SUDOERS_PATH"
-        fi
+        rollback_system_files "$backup_dir" "$exists_bin" "$had_bin" "$exists_helper" "$had_helper" "$exists_sudoers" "$had_sudoers"
         rm -rf "$backup_dir"
+        trap - EXIT INT TERM HUP
+        (( EUID != 0 )) && sudo -k 2>/dev/null || true
         say "${RED}[!] Failed to install the boot command.${RESET}"
         return 1
     fi
-    rm -rf "$backup_dir"
     say "${GREEN}[+] Installed $BIN_PATH.${RESET}"
     if ! configure_shells; then
-        say "${YELLOW}[!] The core command is installed, but one or more shell integrations could not be configured.${RESET}"
+        rollback_system_files "$backup_dir" "$exists_bin" "$had_bin" "$exists_helper" "$had_helper" "$exists_sudoers" "$had_sudoers"
+        rm -rf "$backup_dir"
+        trap - EXIT INT TERM HUP
+        (( EUID != 0 )) && sudo -k 2>/dev/null || true
+        say "${RED}[!] Failed to configure shell integrations; rolled back system files.${RESET}"
         return 1
     fi
+    rm -rf "$backup_dir"
+    trap - EXIT INT TERM HUP
+    (( EUID != 0 )) && sudo -k 2>/dev/null || true
     print_restart_notice
 }
 
 do_remove() {
-    local has_sys=0 check_path check_dir sys_backup_dir="" had_bin=0 had_helper=0 had_sudoers=0
+    local has_sys=0 check_path check_dir sys_backup_dir=""
+    local exists_bin=0 had_bin=0 exists_helper=0 had_helper=0 exists_sudoers=0 had_sudoers=0
     local -a sys_remaining=()
     if [[ ! -e "$BIN_PATH" && ! -e "$SUDOERS_PATH" && ! -e "$HELPER_PATH" \
         && ! -e "$FISH_FUNC_DIR/boot.fish" && ! -e "$FISH_COMP_DIR/boot.fish" \
@@ -1672,13 +1907,6 @@ do_remove() {
         return 0
     fi
     [[ -e "$BIN_PATH" || -e "$HELPER_PATH" || -e "$SUDOERS_PATH" ]] && has_sys=1
-    if (( has_sys == 1 && EUID != 0 )); then
-        if ! command -v sudo >/dev/null 2>&1; then
-            say "${RED}[!] sudo is required to remove system files. Nothing was removed.${RESET}"
-            return 1
-        fi
-        sudo -v || return 1
-    fi
     if (( EUID != 0 )); then
         for check_path in "$FISH_FUNC_DIR/boot.fish" "$FISH_COMP_DIR/boot.fish" "$ZSH_COMP_DIR/_boot" "$BASH_COMP_DIR/boot" "$NU_DIR/boot.nu" "$STATE_FILE"; do
             if [[ -e "$check_path" ]]; then
@@ -1699,13 +1927,74 @@ do_remove() {
             fi
         done
     fi
+    if (( has_sys == 1 )); then
+        if (( EUID != 0 )); then
+            if ! command -v sudo >/dev/null 2>&1; then
+                say "${RED}[!] sudo is required to remove system files. Nothing was removed.${RESET}"
+                return 1
+            fi
+            sudo -v || return 1
+            trap 'sudo -k 2>/dev/null || true; [[ -n "${sys_backup_dir:-}" ]] && rm -rf "$sys_backup_dir"' EXIT INT TERM HUP
+        else
+            trap '[[ -n "${sys_backup_dir:-}" ]] && rm -rf "$sys_backup_dir"' EXIT INT TERM HUP
+        fi
+        sys_backup_dir="$(mktemp -d)" || {
+            trap - EXIT INT TERM HUP
+            (( EUID != 0 )) && sudo -k 2>/dev/null || true
+            return 1
+        }
+        if run_root test -e "$BIN_PATH" 2>/dev/null; then
+            exists_bin=1
+            if run_root cat "$BIN_PATH" > "$sys_backup_dir/bin" 2>/dev/null; then
+                had_bin=1
+            fi
+        fi
+        if run_root test -e "$HELPER_PATH" 2>/dev/null; then
+            exists_helper=1
+            if run_root cat "$HELPER_PATH" > "$sys_backup_dir/helper" 2>/dev/null; then
+                had_helper=1
+            fi
+        fi
+        if run_root test -e "$SUDOERS_PATH" 2>/dev/null; then
+            exists_sudoers=1
+            if run_root cat "$SUDOERS_PATH" > "$sys_backup_dir/sudoers" 2>/dev/null; then
+                had_sudoers=1
+            fi
+        fi
+        if ! run_root rm -f "$BIN_PATH" "$HELPER_PATH" "$SUDOERS_PATH"; then
+            if (( had_bin == 1 )) && ! run_root test -e "$BIN_PATH" 2>/dev/null; then
+                run_root install -m 755 -o root -g root "$sys_backup_dir/bin" "$BIN_PATH" >/dev/null 2>&1 || true
+            fi
+            if (( had_helper == 1 )) && ! run_root test -e "$HELPER_PATH" 2>/dev/null; then
+                run_root install -m 755 -o root -g root "$sys_backup_dir/helper" "$HELPER_PATH" >/dev/null 2>&1 || true
+            fi
+            if (( had_sudoers == 1 )) && ! run_root test -e "$SUDOERS_PATH" 2>/dev/null; then
+                run_root install -m 440 -o root -g root "$sys_backup_dir/sudoers" "$SUDOERS_PATH" >/dev/null 2>&1 || true
+            fi
+            rm -rf "$sys_backup_dir"
+            trap - EXIT INT TERM HUP
+            (( EUID != 0 )) && sudo -k 2>/dev/null || true
+            for check_path in "$BIN_PATH" "$HELPER_PATH" "$SUDOERS_PATH"; do
+                run_root test -e "$check_path" 2>/dev/null && sys_remaining+=("$check_path")
+            done
+            if (( ${#sys_remaining[@]} > 0 )); then
+                say "${RED}[!] Failed to remove system files (${sys_remaining[*]}). User files were left untouched.${RESET}"
+            else
+                say "${RED}[!] Failed to remove system files. User files were left untouched.${RESET}"
+            fi
+            return 1
+        fi
+        rm -rf "$sys_backup_dir"
+        trap - EXIT INT TERM HUP
+        (( EUID != 0 )) && sudo -k 2>/dev/null || true
+    fi
     if [[ -e "$FISH_FUNC_DIR/boot.fish" || -L "$FISH_FUNC_DIR/boot.fish" ]]; then
         validate_safe_user_path "$FISH_FUNC_DIR/boot.fish" "file" || return 1
         if [[ -f "$STATE_DIR/backup-fish-func" && ! -L "$STATE_DIR/backup-fish-func" ]]; then
             validate_safe_user_path "$STATE_DIR/backup-fish-func" "file" || return 1
-            mv -Tf -- "$STATE_DIR/backup-fish-func" "$FISH_FUNC_DIR/boot.fish" || return 1
+            run_as_target_user mv -Tf -- "$STATE_DIR/backup-fish-func" "$FISH_FUNC_DIR/boot.fish" || return 1
         elif grep -Fqx 'file:fish-func' "$STATE_FILE" 2>/dev/null || grep -Fq "$BIN_PATH" "$FISH_FUNC_DIR/boot.fish" 2>/dev/null; then
-            rm -f -- "$FISH_FUNC_DIR/boot.fish" || return 1
+            run_as_target_user rm -f -- "$FISH_FUNC_DIR/boot.fish" || return 1
         else
             say "${YELLOW}[!] Preserved pre-existing file not created by Multi Boot: ${FISH_FUNC_DIR}/boot.fish${RESET}"
         fi
@@ -1714,9 +2003,9 @@ do_remove() {
         validate_safe_user_path "$FISH_COMP_DIR/boot.fish" "file" || return 1
         if [[ -f "$STATE_DIR/backup-fish-comp" && ! -L "$STATE_DIR/backup-fish-comp" ]]; then
             validate_safe_user_path "$STATE_DIR/backup-fish-comp" "file" || return 1
-            mv -Tf -- "$STATE_DIR/backup-fish-comp" "$FISH_COMP_DIR/boot.fish" || return 1
+            run_as_target_user mv -Tf -- "$STATE_DIR/backup-fish-comp" "$FISH_COMP_DIR/boot.fish" || return 1
         elif grep -Fqx 'file:fish-comp' "$STATE_FILE" 2>/dev/null || grep -Fq "$BIN_PATH" "$FISH_COMP_DIR/boot.fish" 2>/dev/null; then
-            rm -f -- "$FISH_COMP_DIR/boot.fish" || return 1
+            run_as_target_user rm -f -- "$FISH_COMP_DIR/boot.fish" || return 1
         else
             say "${YELLOW}[!] Preserved pre-existing file not created by Multi Boot: ${FISH_COMP_DIR}/boot.fish${RESET}"
         fi
@@ -1725,9 +2014,9 @@ do_remove() {
         validate_safe_user_path "$ZSH_COMP_DIR/_boot" "file" || return 1
         if [[ -f "$STATE_DIR/backup-zsh-comp" && ! -L "$STATE_DIR/backup-zsh-comp" ]]; then
             validate_safe_user_path "$STATE_DIR/backup-zsh-comp" "file" || return 1
-            mv -Tf -- "$STATE_DIR/backup-zsh-comp" "$ZSH_COMP_DIR/_boot" || return 1
+            run_as_target_user mv -Tf -- "$STATE_DIR/backup-zsh-comp" "$ZSH_COMP_DIR/_boot" || return 1
         elif grep -Fqx 'file:zsh-comp' "$STATE_FILE" 2>/dev/null || grep -Fq "$BIN_PATH" "$ZSH_COMP_DIR/_boot" 2>/dev/null; then
-            rm -f -- "$ZSH_COMP_DIR/_boot" || return 1
+            run_as_target_user rm -f -- "$ZSH_COMP_DIR/_boot" || return 1
         else
             say "${YELLOW}[!] Preserved pre-existing file not created by Multi Boot: ${ZSH_COMP_DIR}/_boot${RESET}"
         fi
@@ -1736,9 +2025,9 @@ do_remove() {
         validate_safe_user_path "$BASH_COMP_DIR/boot" "file" || return 1
         if [[ -f "$STATE_DIR/backup-bash-comp" && ! -L "$STATE_DIR/backup-bash-comp" ]]; then
             validate_safe_user_path "$STATE_DIR/backup-bash-comp" "file" || return 1
-            mv -Tf -- "$STATE_DIR/backup-bash-comp" "$BASH_COMP_DIR/boot" || return 1
+            run_as_target_user mv -Tf -- "$STATE_DIR/backup-bash-comp" "$BASH_COMP_DIR/boot" || return 1
         elif grep -Fqx 'file:bash-comp' "$STATE_FILE" 2>/dev/null || grep -Fq "$BIN_PATH" "$BASH_COMP_DIR/boot" 2>/dev/null; then
-            rm -f -- "$BASH_COMP_DIR/boot" || return 1
+            run_as_target_user rm -f -- "$BASH_COMP_DIR/boot" || return 1
         else
             say "${YELLOW}[!] Preserved pre-existing file not created by Multi Boot: ${BASH_COMP_DIR}/boot${RESET}"
         fi
@@ -1747,14 +2036,16 @@ do_remove() {
         validate_safe_user_path "$NU_DIR/boot.nu" "file" || return 1
         if [[ -f "$STATE_DIR/backup-nu-comp" && ! -L "$STATE_DIR/backup-nu-comp" ]]; then
             validate_safe_user_path "$STATE_DIR/backup-nu-comp" "file" || return 1
-            mv -Tf -- "$STATE_DIR/backup-nu-comp" "$NU_DIR/boot.nu" || return 1
+            run_as_target_user mv -Tf -- "$STATE_DIR/backup-nu-comp" "$NU_DIR/boot.nu" || return 1
         elif grep -Fqx 'file:nu-comp' "$STATE_FILE" 2>/dev/null || grep -Fq "$BIN_PATH" "$NU_DIR/boot.nu" 2>/dev/null; then
-            rm -f -- "$NU_DIR/boot.nu" || return 1
+            run_as_target_user rm -f -- "$NU_DIR/boot.nu" || return 1
         else
             say "${YELLOW}[!] Preserved pre-existing file not created by Multi Boot: ${NU_DIR}/boot.nu${RESET}"
         fi
     fi
     if [[ -f "$STATE_FILE" ]] && grep -Fqx 'zsh-fpath' "$STATE_FILE"; then
+        local zsh_single_quoted_dir="'${ZSH_COMP_DIR//\'/\'\\\'\'}'"
+        remove_exact_line "$TARGET_HOME/.zshrc" "fpath=(${zsh_single_quoted_dir} \$fpath)" || return 1
         remove_exact_line "$TARGET_HOME/.zshrc" "fpath=(\"$ZSH_COMP_DIR\" \$fpath)" || return 1
     fi
     if [[ -f "$STATE_FILE" ]] && grep -Fqx 'zsh-compinit' "$STATE_FILE"; then
@@ -1774,42 +2065,8 @@ do_remove() {
     fi
     if [[ -e "$STATE_DIR" ]]; then
         validate_safe_user_path "$STATE_DIR" "dir" || return 1
-        rm -f -- "$STATE_FILE" "$STATE_DIR/backup-fish-func" "$STATE_DIR/backup-fish-comp" "$STATE_DIR/backup-zsh-comp" "$STATE_DIR/backup-bash-comp" "$STATE_DIR/backup-nu-comp"
-        rmdir "$STATE_DIR" 2>/dev/null || true
-    fi
-    if (( has_sys == 1 )); then
-        sys_backup_dir="$(mktemp -d)" || return 1
-        if run_root test -f "$BIN_PATH" 2>/dev/null && run_root cat "$BIN_PATH" > "$sys_backup_dir/bin" 2>/dev/null; then
-            had_bin=1
-        fi
-        if run_root test -f "$HELPER_PATH" 2>/dev/null && run_root cat "$HELPER_PATH" > "$sys_backup_dir/helper" 2>/dev/null; then
-            had_helper=1
-        fi
-        if run_root test -f "$SUDOERS_PATH" 2>/dev/null && run_root cat "$SUDOERS_PATH" > "$sys_backup_dir/sudoers" 2>/dev/null; then
-            had_sudoers=1
-        fi
-        if ! run_root rm -f "$BIN_PATH" "$HELPER_PATH" "$SUDOERS_PATH"; then
-            if (( had_bin == 1 )) && ! run_root test -e "$BIN_PATH" 2>/dev/null; then
-                run_root install -m 755 -o root -g root "$sys_backup_dir/bin" "$BIN_PATH" >/dev/null 2>&1 || true
-            fi
-            if (( had_helper == 1 )) && ! run_root test -e "$HELPER_PATH" 2>/dev/null; then
-                run_root install -m 755 -o root -g root "$sys_backup_dir/helper" "$HELPER_PATH" >/dev/null 2>&1 || true
-            fi
-            if (( had_sudoers == 1 )) && ! run_root test -e "$SUDOERS_PATH" 2>/dev/null; then
-                run_root install -m 440 -o root -g root "$sys_backup_dir/sudoers" "$SUDOERS_PATH" >/dev/null 2>&1 || true
-            fi
-            rm -rf "$sys_backup_dir"
-            for check_path in "$BIN_PATH" "$HELPER_PATH" "$SUDOERS_PATH"; do
-                run_root test -e "$check_path" 2>/dev/null && sys_remaining+=("$check_path")
-            done
-            if (( ${#sys_remaining[@]} > 0 )); then
-                say "${RED}[!] Failed to remove system files (${sys_remaining[*]}). Check your administrator permissions.${RESET}"
-            else
-                say "${RED}[!] Failed to remove system files. Check your administrator permissions.${RESET}"
-            fi
-            return 1
-        fi
-        rm -rf "$sys_backup_dir"
+        run_as_target_user rm -f -- "$STATE_FILE" "$STATE_DIR/backup-fish-func" "$STATE_DIR/backup-fish-comp" "$STATE_DIR/backup-zsh-comp" "$STATE_DIR/backup-bash-comp" "$STATE_DIR/backup-nu-comp"
+        run_as_target_user rmdir "$STATE_DIR" 2>/dev/null || true
     fi
     say "${GREEN}Multi Boot was removed.${RESET}"
     say "${YELLOW}Please restart your Terminal or start a new login session.${RESET}"
@@ -1852,18 +2109,28 @@ do_status() {
         if [[ -z "$VISUDO_BIN" ]]; then
             VISUDO_BIN="$(resolve_binary visudo 2>/dev/null || true)"
         fi
-        if [[ -n "$VISUDO_BIN" ]]; then
-            if run_root "$VISUDO_BIN" -cf "$SUDOERS_PATH" >/dev/null 2>&1; then
-                if run_root grep -Fq 'NOPASSWD' "$SUDOERS_PATH" 2>/dev/null; then
-                    say "${YELLOW}[!] Sudoers: Valid syntax, but contains legacy NOPASSWD${RESET}"
+        if (( EUID == 0 )) || [[ -r "$SUDOERS_PATH" ]]; then
+            if [[ -n "$VISUDO_BIN" ]]; then
+                if "$VISUDO_BIN" -cf "$SUDOERS_PATH" >/dev/null 2>&1; then
+                    if grep -Eq 'NOPASSWD|timestamp_timeout|set-oneshot \*' "$SUDOERS_PATH" 2>/dev/null; then
+                        say "${YELLOW}[!] Sudoers: Valid syntax, but contains legacy permissive directives (run Repair)${RESET}"
+                    else
+                        say "${GREEN}[+] Sudoers: Valid (password-authenticated)${RESET}"
+                    fi
                 else
-                    say "${GREEN}[+] Sudoers: Valid (password-authenticated)${RESET}"
+                    say "${RED}[-] Sudoers: Invalid${RESET}"
                 fi
             else
-                say "${RED}[-] Sudoers: Invalid${RESET}"
+                say "${YELLOW}[!] Sudoers: Present, but visudo is unavailable${RESET}"
             fi
         else
-            say "${YELLOW}[!] Sudoers: Present, but visudo is unavailable${RESET}"
+            local sudoers_meta
+            sudoers_meta="$(stat -c '%u:%g:%a' "$SUDOERS_PATH" 2>/dev/null || true)"
+            if [[ "$sudoers_meta" == "0:0:440" || "$sudoers_meta" == "0:0:400" ]]; then
+                say "${GREEN}[+] Sudoers: Installed with secure permissions (0440 root:root)${RESET}"
+            else
+                say "${RED}[-] Sudoers: Unexpected ownership/permissions (${sudoers_meta})${RESET}"
+            fi
         fi
     else
         say "${RED}[-] Sudoers: Not configured${RESET}"
@@ -1873,14 +2140,14 @@ do_status() {
     [[ -x "$(resolve_binary mcopy 2>/dev/null || true)" && -x "$(resolve_binary mdir 2>/dev/null || true)" ]] && say "${GREEN}[+] mtools: Available${RESET}" || say "${RED}[-] mtools: Missing${RESET}"
     show_efistub_status || true
     if [[ -x "$BIN_PATH" ]]; then
-        "$BIN_PATH" -l || true
+        MULTIBOOT_NO_AUTH=1 "$BIN_PATH" -l || true
     fi
 }
 
 show_menu() {
     while true; do
         printf '\033[2J\033[H'
-        say "${BOLD:-}${GREEN}Multi Boot Management${RESET}"
+        say "${BOLD}${GREEN}Multi Boot Management${RESET}"
         local state
         state="$(installation_state)"
         case "$state" in
@@ -1888,7 +2155,7 @@ show_menu() {
             Incomplete) say "Status: ${YELLOW}Incomplete${RESET}" ;;
             *) say "Status: ${RED}Not installed${RESET}" ;;
         esac
-        say "User: ${CYAN}${TARGET_USER}${RESET}"
+        say "User: ${CYAN}${TARGET_USER}${RESET} (${TARGET_GROUP})"
         printf '\n'
         say "1) Install"
         say "2) Remove"
