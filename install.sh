@@ -26,6 +26,8 @@ if [[ -z "$PASSWD_RECORD" ]]; then
     exit 1
 fi
 TARGET_USER="${PASSWD_RECORD%%:*}"
+TARGET_UID="$(printf '%s\n' "$PASSWD_RECORD" | cut -d: -f3)"
+TARGET_GID="$(printf '%s\n' "$PASSWD_RECORD" | cut -d: -f4)"
 TARGET_HOME="$(printf '%s\n' "$PASSWD_RECORD" | cut -d: -f6)"
 TARGET_GROUP="$(id -gn "$TARGET_USER" 2>/dev/null || printf '%s' "$TARGET_USER")"
 [[ -n "$TARGET_HOME" ]] || TARGET_HOME="/root"
@@ -74,16 +76,31 @@ run_root() {
     fi
 }
 
+is_trusted_root_binary() {
+    local target="$1"
+    local resolved current owner mode
+    [[ -n "$target" && "$target" == /* && -f "$target" && -x "$target" ]] || return 1
+    resolved="$(readlink -f "$target" 2>/dev/null || true)"
+    [[ -n "$resolved" && "$resolved" == /* && -f "$resolved" && -x "$resolved" ]] || return 1
+    for current in "$target" "$resolved"; do
+        while [[ -n "$current" ]]; do
+            [[ -e "$current" ]] || return 1
+            owner="$(stat -c '%u' "$current" 2>/dev/null || printf '1')"
+            mode="$(stat -c '%a' "$current" 2>/dev/null || printf '777')"
+            [[ "$owner" == "0" ]] || return 1
+            (( (8#$mode & 8#0022) == 0 )) || return 1
+            [[ "$current" == "/" ]] && break
+            current="$(dirname "$current")"
+        done
+    done
+    return 0
+}
+
 resolve_binary() {
     local name="$1"
     local path=""
-    path="$(command -v "$name" 2>/dev/null || true)"
-    if [[ -n "$path" && -x "$path" ]]; then
-        printf '%s' "$path"
-        return 0
-    fi
     for path in "/usr/bin/$name" "/usr/sbin/$name" "/bin/$name" "/sbin/$name" "/usr/local/bin/$name" "/usr/local/sbin/$name"; do
-        if [[ -x "$path" ]]; then
+        if is_trusted_root_binary "$path"; then
             printf '%s' "$path"
             return 0
         fi
@@ -92,28 +109,26 @@ resolve_binary() {
 }
 
 is_installed() {
-    local visudo_check
+    local visudo_check helper_shebang
     [[ -x "$BIN_PATH" && -s "$BIN_PATH" ]] || return 1
     [[ "$(head -n 1 "$BIN_PATH" 2>/dev/null)" == '#!/usr/bin/env bash' ]] || return 1
+    grep -Fq 'sudo -v' "$BIN_PATH" 2>/dev/null || return 1
     bash -n "$BIN_PATH" >/dev/null 2>&1 || return 1
     [[ -x "$HELPER_PATH" && -s "$HELPER_PATH" ]] || return 1
+    helper_shebang="$(head -n 1 "$HELPER_PATH" 2>/dev/null || true)"
+    [[ "$helper_shebang" =~ ^#!/.*bash$ && "$helper_shebang" != *"/env "* ]] || return 1
     bash -n "$HELPER_PATH" >/dev/null 2>&1 || return 1
     grep -Fq 'MTOOLS_SKIP_CHECK' "$HELPER_PATH" 2>/dev/null || return 1
+    grep -Fq 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b' "$HELPER_PATH" 2>/dev/null || return 1
     [[ -f "$SUDOERS_PATH" && -s "$SUDOERS_PATH" ]] || return 1
     visudo_check="$(resolve_binary visudo 2>/dev/null || true)"
-    if (( EUID == 0 )); then
+    if (( EUID == 0 )) || [[ -r "$SUDOERS_PATH" ]]; then
         grep -Fq "$HELPER_PATH" "$SUDOERS_PATH" 2>/dev/null || return 1
+        if grep -Fq 'NOPASSWD' "$SUDOERS_PATH" 2>/dev/null; then
+            return 1
+        fi
         if [[ -n "$visudo_check" ]]; then
             "$visudo_check" -cf "$SUDOERS_PATH" >/dev/null 2>&1 || return 1
-        fi
-    else
-        if [[ -r "$SUDOERS_PATH" ]]; then
-            grep -Fq "$HELPER_PATH" "$SUDOERS_PATH" 2>/dev/null || return 1
-            if [[ -n "$visudo_check" ]]; then
-                "$visudo_check" -cf "$SUDOERS_PATH" >/dev/null 2>&1 || return 1
-            fi
-        elif command -v sudo >/dev/null 2>&1; then
-            sudo -n -l "$HELPER_PATH" >/dev/null 2>&1 || return 1
         fi
     fi
     if command -v fish >/dev/null 2>&1 || [[ -d "$FISH_DIR" ]]; then
@@ -728,7 +743,7 @@ prepare_dependencies() {
     fi
     EFI_BIN="$(resolve_binary efibootmgr 2>/dev/null || true)"
     if [[ -z "$EFI_BIN" ]]; then
-        say "${RED}[!] efibootmgr is still unavailable. Installation stopped.${RESET}"
+        say "${RED}[!] efibootmgr is still unavailable or not owned by root. Installation stopped.${RESET}"
         return 1
     fi
     if ! detect_current_efistub; then
@@ -748,7 +763,7 @@ prepare_dependencies() {
     MCOPY_BIN="$(resolve_binary mcopy 2>/dev/null || true)"
     MDIR_BIN="$(resolve_binary mdir 2>/dev/null || true)"
     if [[ -z "$MCOPY_BIN" || -z "$MDIR_BIN" ]]; then
-        say "${RED}[!] mcopy and mdir are required. Installation stopped.${RESET}"
+        say "${RED}[!] Root-owned system mcopy and mdir binaries are required. Installation stopped.${RESET}"
         return 1
     fi
     if ! verify_current_efistub_file; then
@@ -775,34 +790,98 @@ prepare_dependencies() {
         VISUDO_BIN="$(resolve_binary visudo 2>/dev/null || true)"
     fi
     if [[ -z "$VISUDO_BIN" ]]; then
-        say "${RED}[!] visudo is still unavailable. Installation stopped.${RESET}"
+        say "${RED}[!] visudo is still unavailable or not owned by root. Installation stopped.${RESET}"
         return 1
     fi
 }
 
 create_efi_reader_helper() {
-    local temporary
+    local temporary bash_bin lsblk_bin blkid_bin findmnt_bin efibootmgr_bin
+    bash_bin="$(resolve_binary bash 2>/dev/null || true)"
+    if [[ -z "$bash_bin" ]]; then
+        say "${RED}[!] No trusted root-owned bash interpreter was found.${RESET}"
+        return 1
+    fi
+    lsblk_bin="$(resolve_binary lsblk 2>/dev/null || true)"
+    blkid_bin="$(resolve_binary blkid 2>/dev/null || true)"
+    findmnt_bin="$(resolve_binary findmnt 2>/dev/null || true)"
+    efibootmgr_bin="$(resolve_binary efibootmgr 2>/dev/null || true)"
+    if [[ -z "$lsblk_bin" && -z "$blkid_bin" ]]; then
+        say "${RED}[!] Neither lsblk nor blkid is available in trusted system paths.${RESET}"
+        return 1
+    fi
     temporary="$(mktemp)"
-    printf '%b\n' '\043!/usr/bin/env bash' > "$temporary"
+    printf '#!%s\n' "$bash_bin" > "$temporary"
     cat >> "$temporary" <<EOF_HELPER
 set -Eeuo pipefail
-export MTOOLS_SKIP_CHECK=1
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+IFS=\$' \\t\\n'
+unalias -a 2>/dev/null || true
+export PATH MTOOLS_SKIP_CHECK=1
 MCOPY_BIN=$(printf '%q' "$MCOPY_BIN")
 MDIR_BIN=$(printf '%q' "$MDIR_BIN")
+LSBLK_BIN=$(printf '%q' "$lsblk_bin")
+BLKID_BIN=$(printf '%q' "$blkid_bin")
+FINDMNT_BIN=$(printf '%q' "$findmnt_bin")
+EFIBOOTMGR_BIN=$(printf '%q' "$efibootmgr_bin")
 if (( \$# != 3 )); then
     exit 2
 fi
 operation="\$1"
 partuuid="\${2,,}"
 relative="\${3//\\\\//}"
+while [[ "\$relative" == *"//"* ]]; do
+    relative="\${relative//\\/\\//\\/}"
+done
 relative="\${relative#/}"
-[[ "\$partuuid" =~ ^[[:xdigit:]-]{36}$ ]] || exit 2
-[[ "\$relative" =~ ^[A-Za-z0-9._/+@\ -]+$ ]] || exit 2
+[[ "\$partuuid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\$ ]] || exit 2
+[[ -n "\$relative" && "\$relative" =~ ^[A-Za-z0-9._/+@\ -]+\$ ]] || exit 2
 case "/\$relative/" in
-    */../*) exit 2 ;;
+    */../*|*/./*) exit 2 ;;
+esac
+lower_rel="\${relative,,}"
+case "\$lower_rel" in
+    *.efi|*.uki|*.img|*.cpio|*.gz|*.zst|*.lz4|*.xz|*.conf|*.nsh|vmlinuz*|*/vmlinuz*) ;;
+    *) exit 2 ;;
 esac
 device="/dev/disk/by-partuuid/\$partuuid"
 [[ -b "\$device" ]] || exit 1
+real_device="\$(readlink -f "\$device" 2>/dev/null || true)"
+[[ -n "\$real_device" && -b "\$real_device" ]] || exit 1
+parttype=""
+fstype=""
+if [[ -n "\$LSBLK_BIN" && -x "\$LSBLK_BIN" ]]; then
+    parttype="\$("\$LSBLK_BIN" -dnro PARTTYPE "\$real_device" 2>/dev/null | head -n 1 | tr '[:upper:]' '[:lower:]' || true)"
+    fstype="\$("\$LSBLK_BIN" -dnro FSTYPE "\$real_device" 2>/dev/null | head -n 1 | tr '[:upper:]' '[:lower:]' || true)"
+fi
+if [[ -z "\$parttype" && -n "\$BLKID_BIN" && -x "\$BLKID_BIN" ]]; then
+    parttype="\$("\$BLKID_BIN" -o value -s PART_ENTRY_TYPE "\$real_device" 2>/dev/null | head -n 1 | tr '[:upper:]' '[:lower:]' || true)"
+fi
+if [[ -z "\$fstype" && -n "\$BLKID_BIN" && -x "\$BLKID_BIN" ]]; then
+    fstype="\$("\$BLKID_BIN" -o value -s TYPE "\$real_device" 2>/dev/null | head -n 1 | tr '[:upper:]' '[:lower:]' || true)"
+fi
+[[ "\$parttype" == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" ]] || exit 1
+case "\$fstype" in
+    vfat|fat|fat32|msdos) ;;
+    *) exit 1 ;;
+esac
+authorized_esp=0
+if [[ -n "\$EFIBOOTMGR_BIN" && -x "\$EFIBOOTMGR_BIN" ]]; then
+    if "\$EFIBOOTMGR_BIN" -v 2>/dev/null | grep -Fqi "\$partuuid"; then
+        authorized_esp=1
+    fi
+fi
+if (( authorized_esp == 0 )) && [[ -n "\$FINDMNT_BIN" && -x "\$FINDMNT_BIN" ]]; then
+    while IFS= read -r target_mnt; do
+        case "\$target_mnt" in
+            /efi|/boot/efi|/boot)
+                authorized_esp=1
+                break
+                ;;
+        esac
+    done < <("\$FINDMNT_BIN" -rn -S "\$real_device" -o TARGET 2>/dev/null || true)
+fi
+(( authorized_esp == 1 )) || exit 1
 case "\$operation" in
     exists)
         [[ -x "\$MDIR_BIN" ]] || exit 1
@@ -812,22 +891,22 @@ case "\$operation" in
             parent=""
         fi
         if [[ -n "\$parent" ]]; then
-            listing="\$("\$MDIR_BIN" -b -i "\$device" "::/\$parent" 2>/dev/null)" || exit 1
+            listing="\$("\$MDIR_BIN" -b -i "\$real_device" "::/\$parent" 2>/dev/null)" || exit 1
         else
-            listing="\$("\$MDIR_BIN" -b -i "\$device" ::/ 2>/dev/null)" || exit 1
+            listing="\$("\$MDIR_BIN" -b -i "\$real_device" ::/ 2>/dev/null)" || exit 1
         fi
         printf '%s\\n' "\$listing" | grep -Fxi -- "\$basename" >/dev/null
         ;;
     read)
         [[ -x "\$MCOPY_BIN" ]] || exit 1
-        exec "\$MCOPY_BIN" -n -i "\$device" "::/\$relative" -
+        exec "\$MCOPY_BIN" -n -i "\$real_device" "::/\$relative" -
         ;;
     *)
         exit 2
         ;;
 esac
 EOF_HELPER
-    if ! bash -n "$temporary"; then
+    if ! "$bash_bin" -n "$temporary"; then
         rm -f "$temporary"
         say "${RED}[!] The EFI reader helper failed syntax validation.${RESET}"
         return 1
@@ -850,36 +929,36 @@ create_sudoers_rule() {
     temporary="$(mktemp)"
     local boot_id_pattern="[0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF]"
     for candidate in "$EFI_BIN" /usr/bin/efibootmgr /usr/sbin/efibootmgr /bin/efibootmgr /sbin/efibootmgr; do
-        [[ -n "$candidate" && -x "$candidate" ]] || continue
+        [[ -n "$candidate" ]] && is_trusted_root_binary "$candidate" || continue
         if [[ "$seen_paths" != *"|${candidate}|"* ]]; then
             seen_paths+="${candidate}|"
             efi_bins+=("$candidate")
         fi
         real_candidate="$(readlink -f "$candidate" 2>/dev/null || true)"
-        if [[ -n "$real_candidate" && -x "$real_candidate" && "$seen_paths" != *"|${real_candidate}|"* ]]; then
+        if [[ -n "$real_candidate" ]] && is_trusted_root_binary "$real_candidate" && [[ "$seen_paths" != *"|${real_candidate}|"* ]]; then
             seen_paths+="${real_candidate}|"
             efi_bins+=("$real_candidate")
         fi
     done
     if (( ${#efi_bins[@]} == 0 )); then
         rm -f "$temporary"
-        say "${RED}[!] No usable efibootmgr binary was found.${RESET}"
+        say "${RED}[!] No usable trusted efibootmgr binary was found.${RESET}"
         return 1
     fi
     for candidate in "${efi_bins[@]}"; do
-        commands+="${candidate}, ${candidate} -v, ${candidate} -n ${boot_id_pattern}, ${candidate} --bootnext ${boot_id_pattern}, ${candidate} -N, ${candidate} --delete-bootnext, "
+        commands+="${candidate} -v, ${candidate} -n ${boot_id_pattern}, ${candidate} --bootnext ${boot_id_pattern}, ${candidate} -N, ${candidate} --delete-bootnext, "
     done
-    commands+="${HELPER_PATH} *"
+    commands+="${HELPER_PATH} exists *, ${HELPER_PATH} read *"
     seen_paths="|"
     if [[ -n "$SYSTEMCTL_BIN" ]]; then
         for candidate in "$SYSTEMCTL_BIN" /usr/bin/systemctl /bin/systemctl /usr/sbin/systemctl /sbin/systemctl; do
-            [[ -n "$candidate" && -x "$candidate" ]] || continue
+            [[ -n "$candidate" ]] && is_trusted_root_binary "$candidate" || continue
             if [[ "$seen_paths" != *"|${candidate}|"* ]]; then
                 seen_paths+="${candidate}|"
                 systemctl_bins+=("$candidate")
             fi
             real_candidate="$(readlink -f "$candidate" 2>/dev/null || true)"
-            if [[ -n "$real_candidate" && -x "$real_candidate" && "$seen_paths" != *"|${real_candidate}|"* ]]; then
+            if [[ -n "$real_candidate" ]] && is_trusted_root_binary "$real_candidate" && [[ "$seen_paths" != *"|${real_candidate}|"* ]]; then
                 seen_paths+="${real_candidate}|"
                 systemctl_bins+=("$real_candidate")
             fi
@@ -891,13 +970,16 @@ create_sudoers_rule() {
     seen_paths="|"
     if [[ -n "$REBOOT_BIN" ]]; then
         for candidate in "$REBOOT_BIN" /usr/sbin/reboot /sbin/reboot /usr/bin/reboot /bin/reboot; do
-            [[ -n "$candidate" && -x "$candidate" ]] || continue
+            [[ -n "$candidate" ]] && is_trusted_root_binary "$candidate" || continue
+            real_candidate="$(readlink -f "$candidate" 2>/dev/null || printf '%s' "$candidate")"
+            if [[ "$(basename "$real_candidate")" == "systemctl" ]]; then
+                continue
+            fi
             if [[ "$seen_paths" != *"|${candidate}|"* ]]; then
                 seen_paths+="${candidate}|"
                 reboot_bins+=("$candidate")
             fi
-            real_candidate="$(readlink -f "$candidate" 2>/dev/null || true)"
-            if [[ -n "$real_candidate" && -x "$real_candidate" && "$seen_paths" != *"|${real_candidate}|"* ]]; then
+            if [[ -n "$real_candidate" ]] && is_trusted_root_binary "$real_candidate" && [[ "$seen_paths" != *"|${real_candidate}|"* ]]; then
                 seen_paths+="${real_candidate}|"
                 reboot_bins+=("$real_candidate")
             fi
@@ -914,13 +996,13 @@ create_sudoers_rule() {
     seen_paths="|"
     if [[ -n "$BOOTCTL_BIN" ]]; then
         for candidate in "$BOOTCTL_BIN" /usr/bin/bootctl /bin/bootctl /usr/sbin/bootctl /sbin/bootctl; do
-            [[ -n "$candidate" && -x "$candidate" ]] || continue
+            [[ -n "$candidate" ]] && is_trusted_root_binary "$candidate" || continue
             if [[ "$seen_paths" != *"|${candidate}|"* ]]; then
                 seen_paths+="${candidate}|"
                 bootctl_bins+=("$candidate")
             fi
             real_candidate="$(readlink -f "$candidate" 2>/dev/null || true)"
-            if [[ -n "$real_candidate" && -x "$real_candidate" && "$seen_paths" != *"|${real_candidate}|"* ]]; then
+            if [[ -n "$real_candidate" ]] && is_trusted_root_binary "$real_candidate" && [[ "$seen_paths" != *"|${real_candidate}|"* ]]; then
                 seen_paths+="${real_candidate}|"
                 bootctl_bins+=("$real_candidate")
             fi
@@ -929,7 +1011,7 @@ create_sudoers_rule() {
             commands+=", ${candidate} set-oneshot *"
         done
     fi
-    printf '%s ALL=(root) NOPASSWD: %s\n' "$TARGET_USER" "$commands" > "$temporary"
+    printf 'Defaults:%s timestamp_timeout=5\n%s ALL=(root) %s\n' "$TARGET_USER" "$TARGET_USER" "$commands" > "$temporary"
     if ! visudo_output="$(run_root "$VISUDO_BIN" -cf "$temporary" 2>&1)"; then
         rm -f "$temporary"
         say "${RED}[!] The sudoers rule failed visudo validation: ${visudo_output}${RESET}"
@@ -985,8 +1067,117 @@ create_sudoers_rule() {
     fi
     [[ -n "$prev_sudoers" ]] && rm -f "$prev_sudoers"
     if [[ -f /etc/sudoers ]] && ! run_root grep -Eq '^[#@]includedir[[:space:]]+/etc/sudoers\.d/?([[:space:]]|$)' /etc/sudoers 2>/dev/null; then
-        say "${YELLOW}[!] Warning: /etc/sudoers does not appear to include /etc/sudoers.d; passwordless sudo may require enabling @includedir /etc/sudoers.d.${RESET}"
+        say "${YELLOW}[!] Warning: /etc/sudoers does not appear to include /etc/sudoers.d; sudo rules may require enabling @includedir /etc/sudoers.d.${RESET}"
     fi
+}
+
+install_boot_binary() {
+    local temporary
+    temporary="$(mktemp)" || return 1
+    {
+        printf '#!/usr/bin/env bash\n'
+        cat <<'EOF_AUTH'
+if [[ "${1:-}" != "--complete" && "${EUID:-$(id -u)}" -ne 0 ]]; then
+    if command -v sudo >/dev/null 2>&1; then
+        sudo -k 2>/dev/null || true
+        sudo -v || exit 1
+        trap 'sudo -k 2>/dev/null || true' EXIT INT TERM
+    fi
+fi
+EOF_AUTH
+        tail -n +2 "$SRC_SCRIPT"
+    } > "$temporary" || {
+        rm -f "$temporary"
+        return 1
+    }
+    if ! bash -n "$temporary" >/dev/null 2>&1; then
+        rm -f "$temporary"
+        return 1
+    fi
+    if ! run_root install -m 755 -o root -g root "$temporary" "$BIN_PATH"; then
+        rm -f "$temporary"
+        return 1
+    fi
+    rm -f "$temporary"
+    return 0
+}
+
+validate_safe_user_path() {
+    local target="$1"
+    local expect_kind="${2:-any}"
+    local rel current owner
+    local -a components=()
+    [[ -n "$TARGET_HOME" && "$TARGET_HOME" == /* && -d "$TARGET_HOME" && ! -L "$TARGET_HOME" ]] || return 1
+    if (( EUID == 0 )) && [[ "$TARGET_USER" != "root" ]]; then
+        owner="$(stat -c '%u' "$TARGET_HOME" 2>/dev/null || printf '0')"
+        [[ "$owner" == "$TARGET_UID" ]] || return 1
+    fi
+    [[ "$target" == "$TARGET_HOME/"* ]] || return 1
+    rel="${target#"$TARGET_HOME"/}"
+    [[ -n "$rel" ]] || return 1
+    IFS='/' read -ra components <<< "$rel"
+    current="$TARGET_HOME"
+    local last_idx=$(( ${#components[@]} - 1 ))
+    local idx part
+    for ((idx = 0; idx <= last_idx; idx++)); do
+        part="${components[idx]}"
+        [[ -n "$part" && "$part" != "." && "$part" != ".." ]] || return 1
+        current="$current/$part"
+        if [[ -L "$current" ]]; then
+            say "${RED}[!] Refusing to follow symbolic link at ${current}.${RESET}"
+            return 1
+        fi
+        if [[ -e "$current" ]]; then
+            if (( idx < last_idx )); then
+                [[ -d "$current" ]] || return 1
+            else
+                case "$expect_kind" in
+                    dir) [[ -d "$current" ]] || return 1 ;;
+                    file) [[ -f "$current" ]] || return 1 ;;
+                    any) [[ -d "$current" || -f "$current" ]] || return 1 ;;
+                esac
+            fi
+            if (( EUID == 0 )) && [[ "$TARGET_USER" != "root" ]]; then
+                owner="$(stat -c '%u' "$current" 2>/dev/null || printf '0')"
+                [[ "$owner" == "$TARGET_UID" ]] || return 1
+            fi
+        fi
+    done
+    return 0
+}
+
+ensure_safe_user_dir() {
+    local dir="$1"
+    local rel current owner part
+    local -a components=()
+    validate_safe_user_path "$dir" "dir" || return 1
+    rel="${dir#"$TARGET_HOME"/}"
+    IFS='/' read -ra components <<< "$rel"
+    current="$TARGET_HOME"
+    for part in "${components[@]}"; do
+        current="$current/$part"
+        if [[ -L "$current" ]]; then
+            say "${RED}[!] Refusing to follow symbolic link at ${current}.${RESET}"
+            return 1
+        fi
+        if [[ ! -e "$current" ]]; then
+            mkdir "$current" || return 1
+            if [[ -L "$current" ]]; then
+                say "${RED}[!] Symbolic link detected after creating ${current}.${RESET}"
+                return 1
+            fi
+            if (( EUID == 0 )); then
+                chown -h "$TARGET_UID:$TARGET_GID" "$current" || return 1
+            fi
+        else
+            [[ -d "$current" && ! -L "$current" ]] || return 1
+            if (( EUID == 0 )) && [[ "$TARGET_USER" != "root" ]]; then
+                owner="$(stat -c '%u' "$current" 2>/dev/null || printf '0')"
+                [[ "$owner" == "$TARGET_UID" ]] || return 1
+            fi
+        fi
+    done
+    return 0
 }
 
 write_user_file() {
@@ -994,46 +1185,46 @@ write_user_file() {
     local destination="$2"
     local mode="${3:-644}"
     local marker="${4:-}"
-    local dest_dir first_missing="" probe state_first_missing="" state_probe="$STATE_DIR"
+    local dest_dir temporary
+    validate_safe_user_path "$destination" "file" || return 1
     dest_dir="$(dirname "$destination")"
-    probe="$dest_dir"
-    while [[ -n "$probe" && "$probe" != "/" && "$probe" != "$TARGET_HOME" && ! -e "$probe" ]]; do
-        first_missing="$probe"
-        probe="$(dirname "$probe")"
-    done
-    if [[ -n "$marker" && -f "$destination" ]]; then
+    if [[ -n "$marker" && -f "$destination" && ! -L "$destination" ]]; then
         if ! grep -Fqx -- "file:$marker" "$STATE_FILE" 2>/dev/null; then
-            while [[ -n "$state_probe" && "$state_probe" != "/" && "$state_probe" != "$TARGET_HOME" && ! -e "$state_probe" ]]; do
-                state_first_missing="$state_probe"
-                state_probe="$(dirname "$state_probe")"
-            done
-            mkdir -p "$STATE_DIR" || return 1
-            if (( EUID == 0 )) && [[ -n "$state_first_missing" && "$state_first_missing" == "$TARGET_HOME"/* ]]; then
-                chown -R "$TARGET_USER:$TARGET_GROUP" "$state_first_missing" || return 1
-            fi
+            ensure_safe_user_dir "$STATE_DIR" || return 1
+            validate_safe_user_path "$STATE_DIR/backup-$marker" "file" || return 1
             if [[ ! -e "$STATE_DIR/backup-$marker" ]]; then
-                cp -p -- "$destination" "$STATE_DIR/backup-$marker" || return 1
+                cp -P -- "$destination" "$STATE_DIR/backup-$marker" || return 1
                 if (( EUID == 0 )); then
-                    chown "$TARGET_USER:$TARGET_GROUP" "$STATE_DIR/backup-$marker" || return 1
+                    chown -h "$TARGET_UID:$TARGET_GID" "$STATE_DIR/backup-$marker" || return 1
                 fi
             fi
         fi
     fi
-    if ! mkdir -p "$dest_dir"; then
+    ensure_safe_user_dir "$dest_dir" || return 1
+    validate_safe_user_path "$destination" "file" || return 1
+    temporary="$(mktemp "$dest_dir/.multiboot.XXXXXX")" || return 1
+    if ! printf '%s\n' "$source" > "$temporary"; then
+        rm -f "$temporary"
         return 1
     fi
-    if (( EUID == 0 )) && [[ -n "$first_missing" && "$first_missing" == "$TARGET_HOME"/* ]]; then
-        if ! chown -R "$TARGET_USER:$TARGET_GROUP" "$first_missing"; then
+    chmod "$mode" "$temporary" || {
+        rm -f "$temporary"
+        return 1
+    }
+    if (( EUID == 0 )); then
+        chown -h "$TARGET_UID:$TARGET_GID" "$temporary" || {
+            rm -f "$temporary"
             return 1
-        fi
+        }
     fi
-    if ! cat > "$destination" <<< "$source"; then
+    validate_safe_user_path "$destination" "file" || {
+        rm -f "$temporary"
+        return 1
+    }
+    if ! mv -Tf "$temporary" "$destination"; then
+        rm -f "$temporary"
         return 1
     fi
-    if (( EUID == 0 )) && ! chown "$TARGET_USER:$TARGET_GROUP" "$dest_dir" "$destination"; then
-        return 1
-    fi
-    chmod "$mode" "$destination" || return 1
     if [[ -n "$marker" ]]; then
         record_added_directive "file:$marker" || return 1
     fi
@@ -1043,47 +1234,88 @@ append_unique_line() {
     local file="$1"
     local line="$2"
     local marker="${3:-}"
-    local dest_dir first_missing="" probe
+    local dest_dir temporary file_mode="644"
+    validate_safe_user_path "$file" "file" || return 1
     dest_dir="$(dirname "$file")"
-    probe="$dest_dir"
-    while [[ -n "$probe" && "$probe" != "/" && "$probe" != "$TARGET_HOME" && ! -e "$probe" ]]; do
-        first_missing="$probe"
-        probe="$(dirname "$probe")"
-    done
-    mkdir -p "$dest_dir" || return 1
-    if (( EUID == 0 )) && [[ -n "$first_missing" && "$first_missing" == "$TARGET_HOME"/* ]]; then
-        chown -R "$TARGET_USER:$TARGET_GROUP" "$first_missing" || return 1
+    ensure_safe_user_dir "$dest_dir" || return 1
+    validate_safe_user_path "$file" "file" || return 1
+    if [[ -f "$file" ]]; then
+        file_mode="$(stat -c '%a' "$file" 2>/dev/null || printf '644')"
+        if grep -Fqx -- "$line" "$file"; then
+            return 0
+        fi
     fi
-    touch "$file" || return 1
-    if (( EUID == 0 )) && ! chown "$TARGET_USER:$TARGET_GROUP" "$file"; then
+    temporary="$(mktemp "$dest_dir/.multiboot.XXXXXX")" || return 1
+    if [[ -f "$file" ]]; then
+        cat "$file" > "$temporary" || {
+            rm -f "$temporary"
+            return 1
+        }
+    fi
+    printf '%s\n' "$line" >> "$temporary" || {
+        rm -f "$temporary"
+        return 1
+    }
+    chmod "$file_mode" "$temporary" || {
+        rm -f "$temporary"
+        return 1
+    }
+    if (( EUID == 0 )); then
+        chown -h "$TARGET_UID:$TARGET_GID" "$temporary" || {
+            rm -f "$temporary"
+            return 1
+        }
+    fi
+    validate_safe_user_path "$file" "file" || {
+        rm -f "$temporary"
+        return 1
+    }
+    if ! mv -Tf "$temporary" "$file"; then
+        rm -f "$temporary"
         return 1
     fi
-    if ! grep -Fqx -- "$line" "$file"; then
-        printf '%s\n' "$line" >> "$file" || return 1
-        [[ -n "$marker" ]] && record_added_directive "$marker"
-    fi
-    if (( EUID == 0 )) && ! chown "$TARGET_USER:$TARGET_GROUP" "$file"; then
-        return 1
-    fi
+    [[ -n "$marker" ]] && record_added_directive "$marker"
 }
 
 record_added_directive() {
     local marker="$1"
-    local first_missing="" probe="$STATE_DIR"
-    while [[ -n "$probe" && "$probe" != "/" && "$probe" != "$TARGET_HOME" && ! -e "$probe" ]]; do
-        first_missing="$probe"
-        probe="$(dirname "$probe")"
-    done
-    mkdir -p "$STATE_DIR" || return 1
-    if (( EUID == 0 )) && [[ -n "$first_missing" && "$first_missing" == "$TARGET_HOME"/* ]]; then
-        chown -R "$TARGET_USER:$TARGET_GROUP" "$first_missing" || return 1
+    local temporary file_mode="644"
+    ensure_safe_user_dir "$STATE_DIR" || return 1
+    validate_safe_user_path "$STATE_FILE" "file" || return 1
+    if [[ -f "$STATE_FILE" ]]; then
+        file_mode="$(stat -c '%a' "$STATE_FILE" 2>/dev/null || printf '644')"
+        if grep -Fqx -- "$marker" "$STATE_FILE"; then
+            return 0
+        fi
     fi
-    touch "$STATE_FILE" || return 1
-    if ! grep -Fqx -- "$marker" "$STATE_FILE"; then
-        printf '%s\n' "$marker" >> "$STATE_FILE" || return 1
+    temporary="$(mktemp "$STATE_DIR/.multiboot.XXXXXX")" || return 1
+    if [[ -f "$STATE_FILE" ]]; then
+        cat "$STATE_FILE" > "$temporary" || {
+            rm -f "$temporary"
+            return 1
+        }
     fi
+    printf '%s\n' "$marker" >> "$temporary" || {
+        rm -f "$temporary"
+        return 1
+    }
+    chmod "$file_mode" "$temporary" || {
+        rm -f "$temporary"
+        return 1
+    }
     if (( EUID == 0 )); then
-        chown "$TARGET_USER:$TARGET_GROUP" "$STATE_DIR" "$STATE_FILE" || return 1
+        chown -h "$TARGET_UID:$TARGET_GID" "$temporary" || {
+            rm -f "$temporary"
+            return 1
+        }
+    fi
+    validate_safe_user_path "$STATE_FILE" "file" || {
+        rm -f "$temporary"
+        return 1
+    }
+    if ! mv -Tf "$temporary" "$STATE_FILE"; then
+        rm -f "$temporary"
+        return 1
     fi
 }
 
@@ -1091,50 +1323,85 @@ prepend_unique_line() {
     local file="$1"
     local line="$2"
     local marker="${3:-}"
-    local temporary dest_dir first_missing="" probe
+    local temporary dest_dir file_mode="644"
+    validate_safe_user_path "$file" "file" || return 1
     dest_dir="$(dirname "$file")"
-    probe="$dest_dir"
-    while [[ -n "$probe" && "$probe" != "/" && "$probe" != "$TARGET_HOME" && ! -e "$probe" ]]; do
-        first_missing="$probe"
-        probe="$(dirname "$probe")"
-    done
-    mkdir -p "$dest_dir" || return 1
-    if (( EUID == 0 )) && [[ -n "$first_missing" && "$first_missing" == "$TARGET_HOME"/* ]]; then
-        chown -R "$TARGET_USER:$TARGET_GROUP" "$first_missing" || return 1
+    ensure_safe_user_dir "$dest_dir" || return 1
+    validate_safe_user_path "$file" "file" || return 1
+    if [[ -f "$file" ]]; then
+        file_mode="$(stat -c '%a' "$file" 2>/dev/null || printf '644')"
+        if grep -Fqx -- "$line" "$file"; then
+            return 0
+        fi
     fi
-    touch "$file" || return 1
-    if ! grep -Fqx -- "$line" "$file"; then
-        temporary="$(mktemp)" || return 1
-        if ! printf '%s\n' "$line" > "$temporary" || ! cat "$file" >> "$temporary" || ! cat "$temporary" > "$file"; then
+    temporary="$(mktemp "$dest_dir/.multiboot.XXXXXX")" || return 1
+    printf '%s\n' "$line" > "$temporary" || {
+        rm -f "$temporary"
+        return 1
+    }
+    if [[ -f "$file" ]]; then
+        cat "$file" >> "$temporary" || {
             rm -f "$temporary"
             return 1
-        fi
-        rm -f "$temporary"
-        [[ -n "$marker" ]] && record_added_directive "$marker"
+        }
     fi
-    if (( EUID == 0 )) && ! chown "$TARGET_USER:$TARGET_GROUP" "$file"; then
+    chmod "$file_mode" "$temporary" || {
+        rm -f "$temporary"
+        return 1
+    }
+    if (( EUID == 0 )); then
+        chown -h "$TARGET_UID:$TARGET_GID" "$temporary" || {
+            rm -f "$temporary"
+            return 1
+        }
+    fi
+    validate_safe_user_path "$file" "file" || {
+        rm -f "$temporary"
+        return 1
+    }
+    if ! mv -Tf "$temporary" "$file"; then
+        rm -f "$temporary"
         return 1
     fi
+    [[ -n "$marker" ]] && record_added_directive "$marker"
 }
 
 remove_exact_line() {
     local file="$1"
     local line="$2"
-    local temporary
+    local temporary dest_dir file_mode="644"
+    [[ -e "$file" ]] || return 0
+    validate_safe_user_path "$file" "file" || return 1
     [[ -f "$file" ]] || return 0
-    temporary="$(mktemp)" || return 1
-    if ! awk -v target="$line" '$0 != target' "$file" > "$temporary" || ! cat "$temporary" > "$file"; then
+    dest_dir="$(dirname "$file")"
+    file_mode="$(stat -c '%a' "$file" 2>/dev/null || printf '644')"
+    temporary="$(mktemp "$dest_dir/.multiboot.XXXXXX")" || return 1
+    if ! awk -v target="$line" '$0 != target' "$file" > "$temporary"; then
         rm -f "$temporary"
         return 1
     fi
-    rm -f "$temporary"
-    if (( EUID == 0 )) && ! chown "$TARGET_USER:$TARGET_GROUP" "$file"; then
+    chmod "$file_mode" "$temporary" || {
+        rm -f "$temporary"
+        return 1
+    }
+    if (( EUID == 0 )); then
+        chown -h "$TARGET_UID:$TARGET_GID" "$temporary" || {
+            rm -f "$temporary"
+            return 1
+        }
+    fi
+    validate_safe_user_path "$file" "file" || {
+        rm -f "$temporary"
+        return 1
+    }
+    if ! mv -Tf "$temporary" "$file"; then
+        rm -f "$temporary"
         return 1
     fi
 }
 
 configure_shells() {
-    local fish_function fish_completion zsh_completion bash_completion nu_completion profile_file bashrc zshrc nu_config fish_history timestamp target configured_list="" fish_data_first_missing="" probe
+    local fish_function fish_completion zsh_completion bash_completion nu_completion profile_file bashrc zshrc nu_config fish_history fish_hist_tmp fish_hist_mode="644" timestamp target configured_list=""
     local -a targets=()
     mapfile -t targets < <("$BIN_PATH" --complete 2>/dev/null || true)
 
@@ -1150,27 +1417,47 @@ complete -c boot -s f -l force -d 'Force close desktop applications and reboot'
 complete -c boot -a '($BIN_PATH --complete 2>/dev/null | string escape --no-quoted)'"
         write_user_file "$fish_function" "$FISH_FUNC_DIR/boot.fish" 644 "fish-func" || return 1
         write_user_file "$fish_completion" "$FISH_COMP_DIR/boot.fish" 644 "fish-comp" || return 1
-        probe="$FISH_DATA_DIR"
-        while [[ -n "$probe" && "$probe" != "/" && "$probe" != "$TARGET_HOME" && ! -e "$probe" ]]; do
-            fish_data_first_missing="$probe"
-            probe="$(dirname "$probe")"
-        done
-        mkdir -p "$FISH_DATA_DIR" || return 1
-        if (( EUID == 0 )) && [[ -n "$fish_data_first_missing" && "$fish_data_first_missing" == "$TARGET_HOME"/* ]]; then
-            chown -R "$TARGET_USER:$TARGET_GROUP" "$fish_data_first_missing" || return 1
-        fi
+        ensure_safe_user_dir "$FISH_DATA_DIR" || return 1
         fish_history="$FISH_DATA_DIR/fish_history"
-        touch "$fish_history" || return 1
+        validate_safe_user_path "$fish_history" "file" || return 1
+        if [[ -f "$fish_history" ]]; then
+            fish_hist_mode="$(stat -c '%a' "$fish_history" 2>/dev/null || printf '644')"
+        fi
+        fish_hist_tmp="$(mktemp "$FISH_DATA_DIR/.multiboot.XXXXXX")" || return 1
+        if [[ -f "$fish_history" ]]; then
+            cat "$fish_history" > "$fish_hist_tmp" || {
+                rm -f "$fish_hist_tmp"
+                return 1
+            }
+        fi
         timestamp="$(date +%s)"
         for target in "${targets[@]:-}"; do
             [[ -n "$target" ]] || continue
             local history_command="boot '$target'"
-            if ! grep -Fq -- "- cmd: $history_command" "$fish_history"; then
-                printf -- "- cmd: %s\n  when: %s\n" "$history_command" "$timestamp" >> "$fish_history" || return 1
+            if ! grep -Fq -- "- cmd: $history_command" "$fish_hist_tmp"; then
+                printf -- "- cmd: %s\n  when: %s\n" "$history_command" "$timestamp" >> "$fish_hist_tmp" || {
+                    rm -f "$fish_hist_tmp"
+                    return 1
+                }
             fi
         done
+        chmod "$fish_hist_mode" "$fish_hist_tmp" || {
+            rm -f "$fish_hist_tmp"
+            return 1
+        }
         if (( EUID == 0 )); then
-            chown "$TARGET_USER:$TARGET_GROUP" "$fish_history" || return 1
+            chown -h "$TARGET_UID:$TARGET_GID" "$fish_hist_tmp" || {
+                rm -f "$fish_hist_tmp"
+                return 1
+            }
+        fi
+        validate_safe_user_path "$fish_history" "file" || {
+            rm -f "$fish_hist_tmp"
+            return 1
+        }
+        if ! mv -Tf "$fish_hist_tmp" "$fish_history"; then
+            rm -f "$fish_hist_tmp"
+            return 1
         fi
         configured_list+="Fish, "
     fi
@@ -1243,6 +1530,7 @@ export extern boot [...args: string@\"nu-complete boot\"]"
     fi
 
     profile_file="$TARGET_HOME/.profile"
+    validate_safe_user_path "$profile_file" "file" || return 1
     if ! grep -Fq '/usr/local/bin' "$profile_file" 2>/dev/null; then
         append_unique_line "$profile_file" 'export PATH="/usr/local/bin:$PATH"' profile-path || return 1
     fi
@@ -1263,11 +1551,11 @@ do_install() {
     if [[ "$action" == "repair" ]]; then
         say "${BLUE}[*] Preparing Multi Boot repair.${RESET}"
         first_confirmation="Repair Multi Boot for ${TARGET_USER}? (y/n)"
-        second_confirmation="This will replace the core command, revalidate EFISTUB, refresh passwordless UEFI permissions, and rebuild shell integrations. Continue? (y/n)"
+        second_confirmation="This will replace the core command, revalidate EFISTUB, refresh sudo UEFI permissions, and rebuild shell integrations. Continue? (y/n)"
     else
         say "${BLUE}[*] Preparing Multi Boot installation.${RESET}"
         first_confirmation="Install Multi Boot for ${TARGET_USER}? (y/n)"
-        second_confirmation="This will install a system-wide boot command and configure passwordless UEFI boot and reboot operations. Continue? (y/n)"
+        second_confirmation="This will install a system-wide boot command and configure password-authenticated UEFI boot and reboot permissions. Continue? (y/n)"
     fi
     if ! validate_source; then
         return 1
@@ -1340,7 +1628,7 @@ do_install() {
         say "${RED}[!] Failed to create the system binary directory.${RESET}"
         return 1
     fi
-    if ! run_root install -m 755 -o root -g root "$SRC_SCRIPT" "$BIN_PATH"; then
+    if ! install_boot_binary; then
         if (( had_bin == 1 )); then
             run_root install -m 755 -o root -g root "$backup_dir/bin" "$BIN_PATH" >/dev/null 2>&1 || true
         else
@@ -1411,45 +1699,55 @@ do_remove() {
             fi
         done
     fi
-    if [[ -e "$FISH_FUNC_DIR/boot.fish" ]]; then
-        if [[ -f "$STATE_DIR/backup-fish-func" ]]; then
-            mv -f -- "$STATE_DIR/backup-fish-func" "$FISH_FUNC_DIR/boot.fish" || return 1
+    if [[ -e "$FISH_FUNC_DIR/boot.fish" || -L "$FISH_FUNC_DIR/boot.fish" ]]; then
+        validate_safe_user_path "$FISH_FUNC_DIR/boot.fish" "file" || return 1
+        if [[ -f "$STATE_DIR/backup-fish-func" && ! -L "$STATE_DIR/backup-fish-func" ]]; then
+            validate_safe_user_path "$STATE_DIR/backup-fish-func" "file" || return 1
+            mv -Tf -- "$STATE_DIR/backup-fish-func" "$FISH_FUNC_DIR/boot.fish" || return 1
         elif grep -Fqx 'file:fish-func' "$STATE_FILE" 2>/dev/null || grep -Fq "$BIN_PATH" "$FISH_FUNC_DIR/boot.fish" 2>/dev/null; then
             rm -f -- "$FISH_FUNC_DIR/boot.fish" || return 1
         else
             say "${YELLOW}[!] Preserved pre-existing file not created by Multi Boot: ${FISH_FUNC_DIR}/boot.fish${RESET}"
         fi
     fi
-    if [[ -e "$FISH_COMP_DIR/boot.fish" ]]; then
-        if [[ -f "$STATE_DIR/backup-fish-comp" ]]; then
-            mv -f -- "$STATE_DIR/backup-fish-comp" "$FISH_COMP_DIR/boot.fish" || return 1
+    if [[ -e "$FISH_COMP_DIR/boot.fish" || -L "$FISH_COMP_DIR/boot.fish" ]]; then
+        validate_safe_user_path "$FISH_COMP_DIR/boot.fish" "file" || return 1
+        if [[ -f "$STATE_DIR/backup-fish-comp" && ! -L "$STATE_DIR/backup-fish-comp" ]]; then
+            validate_safe_user_path "$STATE_DIR/backup-fish-comp" "file" || return 1
+            mv -Tf -- "$STATE_DIR/backup-fish-comp" "$FISH_COMP_DIR/boot.fish" || return 1
         elif grep -Fqx 'file:fish-comp' "$STATE_FILE" 2>/dev/null || grep -Fq "$BIN_PATH" "$FISH_COMP_DIR/boot.fish" 2>/dev/null; then
             rm -f -- "$FISH_COMP_DIR/boot.fish" || return 1
         else
             say "${YELLOW}[!] Preserved pre-existing file not created by Multi Boot: ${FISH_COMP_DIR}/boot.fish${RESET}"
         fi
     fi
-    if [[ -e "$ZSH_COMP_DIR/_boot" ]]; then
-        if [[ -f "$STATE_DIR/backup-zsh-comp" ]]; then
-            mv -f -- "$STATE_DIR/backup-zsh-comp" "$ZSH_COMP_DIR/_boot" || return 1
+    if [[ -e "$ZSH_COMP_DIR/_boot" || -L "$ZSH_COMP_DIR/_boot" ]]; then
+        validate_safe_user_path "$ZSH_COMP_DIR/_boot" "file" || return 1
+        if [[ -f "$STATE_DIR/backup-zsh-comp" && ! -L "$STATE_DIR/backup-zsh-comp" ]]; then
+            validate_safe_user_path "$STATE_DIR/backup-zsh-comp" "file" || return 1
+            mv -Tf -- "$STATE_DIR/backup-zsh-comp" "$ZSH_COMP_DIR/_boot" || return 1
         elif grep -Fqx 'file:zsh-comp' "$STATE_FILE" 2>/dev/null || grep -Fq "$BIN_PATH" "$ZSH_COMP_DIR/_boot" 2>/dev/null; then
             rm -f -- "$ZSH_COMP_DIR/_boot" || return 1
         else
             say "${YELLOW}[!] Preserved pre-existing file not created by Multi Boot: ${ZSH_COMP_DIR}/_boot${RESET}"
         fi
     fi
-    if [[ -e "$BASH_COMP_DIR/boot" ]]; then
-        if [[ -f "$STATE_DIR/backup-bash-comp" ]]; then
-            mv -f -- "$STATE_DIR/backup-bash-comp" "$BASH_COMP_DIR/boot" || return 1
+    if [[ -e "$BASH_COMP_DIR/boot" || -L "$BASH_COMP_DIR/boot" ]]; then
+        validate_safe_user_path "$BASH_COMP_DIR/boot" "file" || return 1
+        if [[ -f "$STATE_DIR/backup-bash-comp" && ! -L "$STATE_DIR/backup-bash-comp" ]]; then
+            validate_safe_user_path "$STATE_DIR/backup-bash-comp" "file" || return 1
+            mv -Tf -- "$STATE_DIR/backup-bash-comp" "$BASH_COMP_DIR/boot" || return 1
         elif grep -Fqx 'file:bash-comp' "$STATE_FILE" 2>/dev/null || grep -Fq "$BIN_PATH" "$BASH_COMP_DIR/boot" 2>/dev/null; then
             rm -f -- "$BASH_COMP_DIR/boot" || return 1
         else
             say "${YELLOW}[!] Preserved pre-existing file not created by Multi Boot: ${BASH_COMP_DIR}/boot${RESET}"
         fi
     fi
-    if [[ -e "$NU_DIR/boot.nu" ]]; then
-        if [[ -f "$STATE_DIR/backup-nu-comp" ]]; then
-            mv -f -- "$STATE_DIR/backup-nu-comp" "$NU_DIR/boot.nu" || return 1
+    if [[ -e "$NU_DIR/boot.nu" || -L "$NU_DIR/boot.nu" ]]; then
+        validate_safe_user_path "$NU_DIR/boot.nu" "file" || return 1
+        if [[ -f "$STATE_DIR/backup-nu-comp" && ! -L "$STATE_DIR/backup-nu-comp" ]]; then
+            validate_safe_user_path "$STATE_DIR/backup-nu-comp" "file" || return 1
+            mv -Tf -- "$STATE_DIR/backup-nu-comp" "$NU_DIR/boot.nu" || return 1
         elif grep -Fqx 'file:nu-comp' "$STATE_FILE" 2>/dev/null || grep -Fq "$BIN_PATH" "$NU_DIR/boot.nu" 2>/dev/null; then
             rm -f -- "$NU_DIR/boot.nu" || return 1
         else
@@ -1474,8 +1772,11 @@ do_remove() {
     if [[ -f "$STATE_FILE" ]] && grep -Fqx 'profile-path' "$STATE_FILE"; then
         remove_exact_line "$TARGET_HOME/.profile" 'export PATH="/usr/local/bin:$PATH"' || return 1
     fi
-    rm -f -- "$STATE_FILE" "$STATE_DIR/backup-fish-func" "$STATE_DIR/backup-fish-comp" "$STATE_DIR/backup-zsh-comp" "$STATE_DIR/backup-bash-comp" "$STATE_DIR/backup-nu-comp"
-    rmdir "$STATE_DIR" 2>/dev/null || true
+    if [[ -e "$STATE_DIR" ]]; then
+        validate_safe_user_path "$STATE_DIR" "dir" || return 1
+        rm -f -- "$STATE_FILE" "$STATE_DIR/backup-fish-func" "$STATE_DIR/backup-fish-comp" "$STATE_DIR/backup-zsh-comp" "$STATE_DIR/backup-bash-comp" "$STATE_DIR/backup-nu-comp"
+        rmdir "$STATE_DIR" 2>/dev/null || true
+    fi
     if (( has_sys == 1 )); then
         sys_backup_dir="$(mktemp -d)" || return 1
         if run_root test -f "$BIN_PATH" 2>/dev/null && run_root cat "$BIN_PATH" > "$sys_backup_dir/bin" 2>/dev/null; then
@@ -1553,7 +1854,11 @@ do_status() {
         fi
         if [[ -n "$VISUDO_BIN" ]]; then
             if run_root "$VISUDO_BIN" -cf "$SUDOERS_PATH" >/dev/null 2>&1; then
-                say "${GREEN}[+] Sudoers: Valid${RESET}"
+                if run_root grep -Fq 'NOPASSWD' "$SUDOERS_PATH" 2>/dev/null; then
+                    say "${YELLOW}[!] Sudoers: Valid syntax, but contains legacy NOPASSWD${RESET}"
+                else
+                    say "${GREEN}[+] Sudoers: Valid (password-authenticated)${RESET}"
+                fi
             else
                 say "${RED}[-] Sudoers: Invalid${RESET}"
             fi
