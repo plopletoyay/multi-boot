@@ -130,10 +130,15 @@ is_trusted_root_binary() {
     [[ -n "$resolved" && "$resolved" == /* && -f "$resolved" && -x "$resolved" ]] || return 1
     for current in "$target" "$resolved"; do
         while [[ -n "$current" ]]; do
-            [[ -e "$current" ]] || return 1
+            [[ -e "$current" || -L "$current" ]] || return 1
             owner="$(stat -c '%u' "$current" 2>/dev/null || printf '1')"
-            mode="$(stat -c '%a' "$current" 2>/dev/null || printf '777')"
             [[ "$owner" == "0" ]] || return 1
+            if [[ -L "$current" ]]; then
+                [[ -e "$current" ]] || return 1
+                mode="$(stat -L -c '%a' "$current" 2>/dev/null || printf '777')"
+            else
+                mode="$(stat -c '%a' "$current" 2>/dev/null || printf '777')"
+            fi
             (( (8#$mode & 8#0022) == 0 )) || return 1
             [[ "$current" == "/" ]] && break
             current="$(dirname "$current")"
@@ -144,14 +149,49 @@ is_trusted_root_binary() {
 
 resolve_binary() {
     local name="$1"
-    local path=""
-    for path in "/usr/bin/$name" "/usr/sbin/$name" "/bin/$name" "/sbin/$name" "/usr/local/bin/$name" "/usr/local/sbin/$name"; do
+    local path="" dir="" seen="|"
+    local -a search_dirs=("/usr/bin" "/usr/sbin" "/bin" "/sbin" "/usr/local/bin" "/usr/local/sbin")
+    local -a path_dirs=()
+    IFS=':' read -ra path_dirs <<< "${PATH:-}"
+    for dir in "${path_dirs[@]}"; do
+        [[ -n "$dir" && "$dir" == /* ]] && search_dirs+=("$dir")
+    done
+    for dir in "${search_dirs[@]}"; do
+        [[ "$seen" == *"|${dir}|"* ]] && continue
+        seen+="${dir}|"
+        path="${dir%/}/$name"
         if is_trusted_root_binary "$path"; then
             printf '%s' "$path"
             return 0
         fi
     done
     return 1
+}
+
+diagnose_binary() {
+    local name="$1"
+    local found_untrusted="" dir="" owner mode
+    local -a search_dirs=("/usr/bin" "/usr/sbin" "/bin" "/sbin" "/usr/local/bin" "/usr/local/sbin")
+    for dir in "${search_dirs[@]}"; do
+        if [[ -e "$dir/$name" || -L "$dir/$name" ]]; then
+            found_untrusted="$dir/$name"
+            break
+        fi
+    done
+    if [[ -z "$found_untrusted" ]]; then
+        found_untrusted="$(command -v "$name" 2>/dev/null || true)"
+    fi
+    if [[ -z "$found_untrusted" ]]; then
+        printf 'not found on system'
+        return 0
+    fi
+    if [[ ! -e "$found_untrusted" ]]; then
+        printf 'broken symlink at %s' "$found_untrusted"
+        return 0
+    fi
+    owner="$(stat -c '%u' "$found_untrusted" 2>/dev/null || printf '?')"
+    mode="$(stat -L -c '%a' "$found_untrusted" 2>/dev/null || printf '?')"
+    printf 'untrusted path %s (uid=%s, mode=%s)' "$found_untrusted" "$owner" "$mode"
 }
 
 run_as_target_user() {
@@ -251,6 +291,10 @@ confirm_twice() {
     [[ "${answer,,}" == y || "${answer,,}" == yes ]]
 }
 
+has_pm() {
+    command -v "$1" >/dev/null 2>&1 || resolve_binary "$1" >/dev/null 2>&1
+}
+
 detect_package_manager() {
     local os_id="" os_like=""
     if [[ -r /etc/os-release ]]; then
@@ -259,67 +303,81 @@ detect_package_manager() {
     fi
     case " $os_id $os_like " in
         *" debian "*|*" ubuntu "*|*" linuxmint "*|*" pop "*|*" kali "*|*" elementary "*|*" zorin "*)
-            if command -v apt-get >/dev/null 2>&1; then printf 'apt-get'; return 0; fi ;;
+            if has_pm apt-get; then printf 'apt-get'; return 0; fi ;;
         *" arch "*|*" manjaro "*|*" endeavouros "*|*" cachyos "*|*" garuda "*|*" artix "*)
-            if command -v pacman >/dev/null 2>&1; then printf 'pacman'; return 0; fi ;;
+            if has_pm pacman; then printf 'pacman'; return 0; fi ;;
         *" fedora "*|*" rhel "*|*" centos "*|*" rocky "*|*" almalinux "*|*" ol "*)
-            if command -v dnf >/dev/null 2>&1; then printf 'dnf'; return 0; fi
-            if command -v yum >/dev/null 2>&1; then printf 'yum'; return 0; fi ;;
+            if has_pm dnf; then printf 'dnf'; return 0; fi
+            if has_pm yum; then printf 'yum'; return 0; fi ;;
         *" suse "*|*" opensuse "*|*" sles "*)
-            if command -v zypper >/dev/null 2>&1; then printf 'zypper'; return 0; fi ;;
+            if has_pm zypper; then printf 'zypper'; return 0; fi ;;
         *" alpine "*)
-            if command -v apk >/dev/null 2>&1; then printf 'apk'; return 0; fi ;;
+            if has_pm apk; then printf 'apk'; return 0; fi ;;
         *" void "*)
-            if command -v xbps-install >/dev/null 2>&1; then printf 'xbps-install'; return 0; fi ;;
+            if has_pm xbps-install; then printf 'xbps-install'; return 0; fi ;;
         *" gentoo "*)
-            if command -v emerge >/dev/null 2>&1; then printf 'emerge'; return 0; fi ;;
+            if has_pm emerge; then printf 'emerge'; return 0; fi ;;
     esac
-    if [[ -f /var/lib/dpkg/status ]] && command -v apt-get >/dev/null 2>&1; then
+    if [[ -f /var/lib/dpkg/status ]] && has_pm apt-get; then
         printf 'apt-get'
-    elif [[ -d /var/lib/pacman ]] && command -v pacman >/dev/null 2>&1; then
+    elif [[ -d /var/lib/pacman ]] && has_pm pacman; then
         printf 'pacman'
-    elif [[ -d /var/lib/rpm ]] && command -v dnf >/dev/null 2>&1; then
+    elif [[ -d /var/lib/rpm ]] && has_pm dnf; then
         printf 'dnf'
-    elif [[ -d /var/lib/rpm ]] && command -v zypper >/dev/null 2>&1; then
+    elif [[ -d /var/lib/rpm ]] && has_pm zypper; then
         printf 'zypper'
-    elif [[ -d /etc/apk ]] && command -v apk >/dev/null 2>&1; then
+    elif [[ -d /etc/apk ]] && has_pm apk; then
         printf 'apk'
-    elif [[ -d /var/db/xbps ]] && command -v xbps-install >/dev/null 2>&1; then
+    elif [[ -d /var/db/xbps ]] && has_pm xbps-install; then
         printf 'xbps-install'
-    elif [[ -d /var/lib/rpm ]] && command -v yum >/dev/null 2>&1; then
+    elif [[ -d /var/lib/rpm ]] && has_pm yum; then
         printf 'yum'
-    elif [[ -d /var/db/pkg ]] && command -v emerge >/dev/null 2>&1; then
+    elif [[ -d /var/db/pkg ]] && has_pm emerge; then
         printf 'emerge'
-    elif command -v apt-get >/dev/null 2>&1; then
+    elif has_pm apt-get; then
         printf 'apt-get'
-    elif command -v dnf >/dev/null 2>&1; then
+    elif has_pm dnf; then
         printf 'dnf'
-    elif command -v pacman >/dev/null 2>&1; then
+    elif has_pm pacman; then
         printf 'pacman'
-    elif command -v zypper >/dev/null 2>&1; then
+    elif has_pm zypper; then
         printf 'zypper'
-    elif command -v xbps-install >/dev/null 2>&1; then
+    elif has_pm xbps-install; then
         printf 'xbps-install'
-    elif command -v apk >/dev/null 2>&1; then
+    elif has_pm apk; then
         printf 'apk'
-    elif command -v yum >/dev/null 2>&1; then
+    elif has_pm yum; then
         printf 'yum'
-    elif command -v emerge >/dev/null 2>&1; then
+    elif has_pm emerge; then
         printf 'emerge'
     else
         return 1
     fi
 }
 
+package_binaries_ready() {
+    local package="$1"
+    case "$package" in
+        efibootmgr)
+            resolve_binary efibootmgr >/dev/null 2>&1
+            ;;
+        mtools)
+            resolve_binary mcopy >/dev/null 2>&1 && resolve_binary mdir >/dev/null 2>&1
+            ;;
+        sudo)
+            resolve_binary visudo >/dev/null 2>&1
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
 install_package() {
     local package="$1"
     local pm=""
-    if [[ "$package" == efibootmgr ]] && resolve_binary efibootmgr >/dev/null 2>&1; then
-        say "${GREEN}[+] efibootmgr is already installed.${RESET}"
-        return 0
-    fi
-    if [[ "$package" == mtools ]] && resolve_binary mcopy >/dev/null 2>&1 && resolve_binary mdir >/dev/null 2>&1; then
-        say "${GREEN}[+] mtools is already installed.${RESET}"
+    if package_binaries_ready "$package"; then
+        say "${GREEN}[+] ${package} is already installed.${RESET}"
         return 0
     fi
     pm="$(detect_package_manager 2>/dev/null || true)"
@@ -337,27 +395,52 @@ install_package() {
                 fi
                 run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$package" || return 1
             fi
+            if ! package_binaries_ready "$package"; then
+                run_root env DEBIAN_FRONTEND=noninteractive apt-get install --reinstall -y --no-install-recommends "$package" || return 1
+            fi
             ;;
         pacman)
             run_root pacman -S --needed --noconfirm "$package" || return 1
+            if ! package_binaries_ready "$package"; then
+                say "${YELLOW}[!] Package '${package}' is registered in pacman DB but binaries are missing; forcing reinstall.${RESET}"
+                run_root pacman -S --noconfirm "$package" || return 1
+            fi
             ;;
         dnf)
             run_root dnf install -y "$package" || return 1
+            if ! package_binaries_ready "$package"; then
+                run_root dnf reinstall -y "$package" || return 1
+            fi
             ;;
         zypper)
             run_root zypper --non-interactive install -y "$package" || return 1
+            if ! package_binaries_ready "$package"; then
+                run_root zypper --non-interactive install -f -y "$package" || return 1
+            fi
             ;;
         xbps-install)
             run_root xbps-install -Sy "$package" || return 1
+            if ! package_binaries_ready "$package"; then
+                run_root xbps-install -fy "$package" || return 1
+            fi
             ;;
         apk)
             run_root apk add "$package" || return 1
+            if ! package_binaries_ready "$package"; then
+                run_root apk fix "$package" || return 1
+            fi
             ;;
         yum)
             run_root yum install -y "$package" || return 1
+            if ! package_binaries_ready "$package"; then
+                run_root yum reinstall -y "$package" || return 1
+            fi
             ;;
         emerge)
             run_root emerge --noreplace "$package" || return 1
+            if ! package_binaries_ready "$package"; then
+                run_root emerge "$package" || return 1
+            fi
             ;;
     esac
     INSTALLED_PACKAGES+=("$package")
@@ -366,6 +449,10 @@ install_package() {
 validate_source() {
     if [[ ! -f "$SRC_SCRIPT" || ! -s "$SRC_SCRIPT" ]]; then
         say "${RED}[!] The boot script was not found beside install.sh.${RESET}"
+        return 1
+    fi
+    if head -n 1 "$SRC_SCRIPT" | grep -q $'\r'; then
+        say "${RED}[!] The boot script contains Windows CRLF line endings. Convert it to LF first.${RESET}"
         return 1
     fi
     if [[ "$(head -n 1 "$SRC_SCRIPT")" != '#!/usr/bin/env bash' ]]; then
@@ -899,7 +986,7 @@ prepare_dependencies() {
     fi
     EFI_BIN="$(resolve_binary efibootmgr 2>/dev/null || true)"
     if [[ -z "$EFI_BIN" ]]; then
-        say "${RED}[!] efibootmgr is still unavailable or not owned by root. Installation stopped.${RESET}"
+        say "${RED}[!] efibootmgr is unavailable ($(diagnose_binary efibootmgr)). Installation stopped.${RESET}"
         return 1
     fi
     if ! detect_current_efistub; then
@@ -919,7 +1006,7 @@ prepare_dependencies() {
     MCOPY_BIN="$(resolve_binary mcopy 2>/dev/null || true)"
     MDIR_BIN="$(resolve_binary mdir 2>/dev/null || true)"
     if [[ -z "$MCOPY_BIN" || -z "$MDIR_BIN" ]]; then
-        say "${RED}[!] Root-owned system mcopy and mdir binaries are required. Installation stopped.${RESET}"
+        say "${RED}[!] Root-owned system mcopy ($(diagnose_binary mcopy)) and mdir ($(diagnose_binary mdir)) binaries are required. Installation stopped.${RESET}"
         return 1
     fi
     if ! verify_current_efistub_file; then
@@ -946,7 +1033,7 @@ prepare_dependencies() {
         VISUDO_BIN="$(resolve_binary visudo 2>/dev/null || true)"
     fi
     if [[ -z "$VISUDO_BIN" ]]; then
-        say "${RED}[!] visudo is still unavailable or not owned by root. Installation stopped.${RESET}"
+        say "${RED}[!] visudo is unavailable ($(diagnose_binary visudo)). Installation stopped.${RESET}"
         return 1
     fi
 }
@@ -1011,7 +1098,7 @@ case "/\$relative/" in
 esac
 lower_rel="\${relative,,}"
 case "\$lower_rel" in
-    *.efi|*.uki|*.img|*.cpio|*.gz|*.zst|*.lz4|*.xz|*.conf|*.nsh|vmlinuz*|*/vmlinuz*) ;;
+    *.efi|*.uki|*.img|*.cpio|*.gz|*.zst|*.lz4|*.xz|*.conf|*.nsh|vmlinuz*|*/vmlinuz*|vmlinux*|*/vmlinux*|bzimage*|*/bzimage*|image|*/image|image-*|*/image-*) ;;
     *) exit 2 ;;
 esac
 device="/dev/disk/by-partuuid/\$partuuid"
@@ -1238,6 +1325,7 @@ install_boot_binary() {
     {
         printf '#!/usr/bin/env bash\n'
         cat <<'EOF_AUTH'
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 if [[ "${1:-}" != "--complete" && "${MULTIBOOT_NO_AUTH:-0}" != "1" && "${EUID:-$(id -u)}" -ne 0 ]]; then
     if command -v sudo >/dev/null 2>&1; then
         command sudo -k 2>/dev/null || true
@@ -1557,7 +1645,7 @@ remove_exact_line() {
 }
 
 configure_shells() {
-    local fish_function fish_completion zsh_completion bash_completion nu_completion profile_file bashrc zshrc nu_config fish_history fish_hist_tmp fish_hist_mode="644" timestamp target configured_list="" zsh_single_quoted_dir
+    local fish_function fish_completion zsh_completion bash_completion nu_completion profile_file bashrc zshrc nu_config fish_history fish_hist_tmp fish_hist_mode="644" timestamp target configured_list="" zsh_single_quoted_dir escaped_target
     local -a targets=()
     mapfile -t targets < <("$BIN_PATH" --complete 2>/dev/null || true)
 
@@ -1589,7 +1677,8 @@ complete -c boot -a '($BIN_PATH --complete 2>/dev/null | string escape --no-quot
         timestamp="$(date +%s)"
         for target in "${targets[@]:-}"; do
             [[ -n "$target" ]] || continue
-            local history_command="boot '$target'"
+            escaped_target="${target//\'/\'\\\'\'}"
+            local history_command="boot '$escaped_target'"
             if ! grep -Fq -- "- cmd: $history_command" "$fish_hist_tmp"; then
                 if ! printf -- "- cmd: %s\n  when: %s\n" "$history_command" "$timestamp" | run_as_target_user tee -a "$fish_hist_tmp" >/dev/null; then
                     run_as_target_user rm -f "$fish_hist_tmp" >/dev/null 2>&1 || true
@@ -2092,7 +2181,7 @@ show_efistub_status() {
 }
 
 do_status() {
-    local state
+    local state pm_detected shells_summary=""
     say "${BLUE}Multi Boot Status${RESET}"
     state="$(installation_state)"
     case "$state" in
@@ -2100,6 +2189,8 @@ do_status() {
         Incomplete) say "${YELLOW}[!] Installation: Incomplete${RESET}" ;;
         *) say "${RED}[-] Installation: Not installed${RESET}" ;;
     esac
+    pm_detected="$(detect_package_manager 2>/dev/null || printf 'unknown')"
+    say "${BLUE}[*] Package manager: ${pm_detected}${RESET}"
     if [[ -x "$BIN_PATH" ]]; then
         say "${GREEN}[+] Core: Installed at ${BIN_PATH}${RESET}"
     else
@@ -2136,8 +2227,25 @@ do_status() {
         say "${RED}[-] Sudoers: Not configured${RESET}"
     fi
     [[ -x "$HELPER_PATH" ]] && say "${GREEN}[+] EFI reader helper: Installed${RESET}" || say "${RED}[-] EFI reader helper: Missing${RESET}"
-    [[ -x "$(resolve_binary efibootmgr 2>/dev/null || true)" ]] && say "${GREEN}[+] efibootmgr: Available${RESET}" || say "${RED}[-] efibootmgr: Missing${RESET}"
-    [[ -x "$(resolve_binary mcopy 2>/dev/null || true)" && -x "$(resolve_binary mdir 2>/dev/null || true)" ]] && say "${GREEN}[+] mtools: Available${RESET}" || say "${RED}[-] mtools: Missing${RESET}"
+    if [[ -x "$(resolve_binary efibootmgr 2>/dev/null || true)" ]]; then
+        say "${GREEN}[+] efibootmgr: Available${RESET}"
+    else
+        say "${RED}[-] efibootmgr: Missing ($(diagnose_binary efibootmgr))${RESET}"
+    fi
+    if [[ -x "$(resolve_binary mcopy 2>/dev/null || true)" && -x "$(resolve_binary mdir 2>/dev/null || true)" ]]; then
+        say "${GREEN}[+] mtools: Available${RESET}"
+    else
+        say "${RED}[-] mtools: Missing (mcopy: $(diagnose_binary mcopy); mdir: $(diagnose_binary mdir))${RESET}"
+    fi
+    [[ -f "$FISH_FUNC_DIR/boot.fish" && -f "$FISH_COMP_DIR/boot.fish" ]] && shells_summary+="Fish "
+    [[ -f "$ZSH_COMP_DIR/_boot" ]] && shells_summary+="Zsh "
+    [[ -f "$BASH_COMP_DIR/boot" ]] && shells_summary+="Bash "
+    [[ -f "$NU_DIR/boot.nu" ]] && shells_summary+="Nushell "
+    if [[ -n "$shells_summary" ]]; then
+        say "${GREEN}[+] Shell integrations: ${shells_summary% }${RESET}"
+    else
+        say "${YELLOW}[-] Shell integrations: None installed${RESET}"
+    fi
     show_efistub_status || true
     if [[ -x "$BIN_PATH" ]]; then
         MULTIBOOT_NO_AUTH=1 "$BIN_PATH" -l || true
