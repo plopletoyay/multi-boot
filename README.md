@@ -527,5 +527,14 @@ multi-boot/
 
 # License & Author
 
-- **Author:** [plopletoyay](https://github.com/plopletoyay)
-- **Repository:** https://github.com/plopletoyay/multi-boot
+Licensed under the **GNU General Public License v3.0**.
+
+SPDX identifier:
+
+```text
+GNU General Public License v3.0
+```
+
+Created by **`plopletoyay`**
+
+> *"Keep It Simple, Stupid."*
