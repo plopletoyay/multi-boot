@@ -1,5 +1,3 @@
-# *HAVE MANY "Critical" SECURITY BUG PLS WAIT AND DON'T USE RIGHT NOW!*
-
 # `multi-boot`
 
 A safety-verified, one-shot CLI operating system and Linux kernel reboot switcher designed for UEFI systems.
